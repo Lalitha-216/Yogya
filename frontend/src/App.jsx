@@ -2,8 +2,25 @@ import { useRef, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
-const SAMPLE_TELUGU_TEXT =
-  "Nenu five years nunchi electrician ga work chestunnanu. Fan installation, wiring repair chestanu.";
+const EXT_BY_MIME = {
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+};
+
+// FastAPI returns `detail` as a string (our own errors) or a list (validation errors).
+async function readError(res, fallback) {
+  try {
+    const body = await res.json();
+    if (typeof body.detail === "string") return body.detail;
+    if (Array.isArray(body.detail) && body.detail[0]?.msg) return body.detail[0].msg;
+  } catch {
+    // response was not JSON
+  }
+  return `${fallback} (HTTP ${res.status})`;
+}
 
 export default function App() {
   const [step, setStep] = useState("landing"); // landing | onboard | result
@@ -34,8 +51,9 @@ export default function App() {
 
       recorder.onstop = async () => {
         stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
-        await sendAudioToBackend(blob, "recording.webm");
+        const mime = (recorder.mimeType || "audio/webm").split(";")[0];
+        const blob = new Blob(chunksRef.current, { type: mime });
+        await sendAudioToBackend(blob, `recording.${EXT_BY_MIME[mime] || "webm"}`);
       };
 
       recorder.start();
@@ -43,7 +61,7 @@ export default function App() {
       setIsRecording(true);
     } catch {
       setStatusMsg(
-        "Microphone unavailable—use sample text below or type your experience directly."
+        "Microphone unavailable. Allow microphone access, upload an audio file, or type your experience below."
       );
     }
   };
@@ -61,20 +79,21 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append("audio", fileOrBlob, filename);
+      formData.append("language", language);
 
       const res = await fetch(`${API_BASE}/api/voice/transcribe`, {
         method: "POST",
         body: formData,
       });
-      if (!res.ok) throw new Error("Transcription failed");
+      if (!res.ok) throw new Error(await readError(res, "Transcription failed"));
       const data = await res.json();
-      setTranscript(data.transcript || "");
+      setTranscript(data.transcript);
       setStatusMsg("Transcript ready—review or edit before generating profile.");
-    } catch {
+    } catch (err) {
+      // Keep whatever the user already typed; never substitute sample text.
       setStatusMsg(
-        "Voice transcription fallback: edit or paste your experience text below and continue."
+        `Transcription failed: ${err.message}. You can type your experience below instead.`
       );
-      if (!transcript) setTranscript(SAMPLE_TELUGU_TEXT);
     } finally {
       setLoading(false);
     }
@@ -85,11 +104,16 @@ export default function App() {
     if (file) {
       await sendAudioToBackend(file, file.name);
     }
+    e.target.value = ""; // allow re-selecting the same file
   };
 
   const handleGenerateProfile = async (e) => {
     e.preventDefault();
-    const finalText = transcript.trim() || SAMPLE_TELUGU_TEXT;
+    const finalText = transcript.trim();
+    if (!finalText) {
+      setStatusMsg("Please record your voice, upload audio, or type your work experience first.");
+      return;
+    }
     setLoading(true);
     setStatusMsg("Extracting structured skill profile...");
     try {
@@ -100,16 +124,22 @@ export default function App() {
           name,
           language,
           location,
+          selected_trade: selectedTrade,
           transcript: finalText,
         }),
       });
-      if (!res.ok) throw new Error("Profile extraction failed");
+      if (!res.ok) throw new Error(await readError(res, "Profile extraction failed"));
       const data = await res.json();
       setSavedResult(data);
       setStep("result");
       setStatusMsg("");
     } catch (err) {
-      setStatusMsg(`Error: ${err.message}. Check that FastAPI is running on port 8000.`);
+      const offline = err instanceof TypeError; // fetch itself failed
+      setStatusMsg(
+        offline
+          ? `Cannot reach the backend at ${API_BASE}. Check that FastAPI is running on port 8000.`
+          : `Error: ${err.message}`
+      );
     } finally {
       setLoading(false);
     }
@@ -184,21 +214,13 @@ export default function App() {
             <label>
               Upload Audio: <input type="file" accept="audio/*" onChange={handleFileUpload} />
             </label>
-            <button
-              type="button"
-              onClick={() => {
-                setTranscript(SAMPLE_TELUGU_TEXT);
-                setStatusMsg("Loaded sample Telugu statement.");
-              }}
-            >
-              Load Sample Telugu Text
-            </button>
           </div>
 
           <div>
-            <label>Transcript / Experience Text (Editable fallback):</label>
+            <label>Transcript / Experience Text (editable):</label>
             <textarea
               rows={4}
+              required
               style={{ width: "100%", marginTop: 6 }}
               value={transcript}
               onChange={(e) => setTranscript(e.target.value)}
@@ -208,7 +230,7 @@ export default function App() {
 
           {statusMsg && <p style={{ color: "#b45309" }}>{statusMsg}</p>}
 
-          <button type="submit" disabled={loading} style={{ padding: "0.75rem 1.25rem" }}>
+          <button type="submit" disabled={loading || isRecording} style={{ padding: "0.75rem 1.25rem" }}>
             {loading ? "Processing..." : "Generate Structured Profile"}
           </button>
         </form>
@@ -218,6 +240,12 @@ export default function App() {
         <section style={{ border: "1px solid #d1d5db", borderRadius: 8, padding: "1.25rem" }}>
           <h2>Structured Worker Profile (Saved #{savedResult.worker_id})</h2>
           <p><strong>Trade:</strong> {savedResult.profile.trade}</p>
+          {savedResult.trade_mismatch && (
+            <p style={{ color: "#b45309" }}>
+              Note: your description sounds more like "{savedResult.detected_trade}" work. Your
+              selected trade was saved.
+            </p>
+          )}
           <p><strong>Experience:</strong> {savedResult.profile.experience_years} years</p>
           <p><strong>Evidence Level:</strong> {savedResult.profile.evidence_level}</p>
           <p><strong>Skills:</strong></p>
@@ -228,7 +256,16 @@ export default function App() {
               </li>
             ))}
           </ul>
-          <button onClick={() => setStep("onboard")}>Create Another Profile</button>
+          <button
+            onClick={() => {
+              setTranscript("");
+              setStatusMsg("");
+              setSavedResult(null);
+              setStep("onboard");
+            }}
+          >
+            Create Another Profile
+          </button>
         </section>
       )}
     </div>
