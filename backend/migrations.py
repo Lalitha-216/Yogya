@@ -3,7 +3,11 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import sqlite3
+
+from assessment.adaptive_engine import Difficulty, Trade
+from assessment.question_bank import QUESTION_BANK, AssessmentQuestion, validate_question_bank
 
 
 MigrationOperation = Callable[[sqlite3.Connection], None]
@@ -199,8 +203,159 @@ def _create_assessment_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+_QUESTION_COLUMNS = (
+    "question_id",
+    "trade",
+    "difficulty",
+    "skill_tag",
+    "question_text_en",
+    "question_text_te",
+    "question_text_hi",
+    "expected_concepts_json",
+    "rubric_json",
+    "safety_critical",
+    "active",
+    "telugu_review_required",
+    "hindi_review_required",
+)
+
+
+def _serialize_question_json(
+    question: AssessmentQuestion,
+) -> tuple[str, str]:
+    """Validate and deterministically serialize structured question fields."""
+    concepts = question.expected_concepts
+    rubric = question.rubric_json
+    if not isinstance(concepts, tuple) or not concepts or any(
+        not isinstance(concept, str) or not concept.strip()
+        for concept in concepts
+    ):
+        raise ValueError(
+            f"Question {question.question_id!r} has invalid expected concepts."
+        )
+    if not isinstance(rubric, dict) or set(rubric) != {"0", "1", "2", "3", "4"}:
+        raise ValueError(
+            f"Question {question.question_id!r} rubric must contain scores 0 through 4."
+        )
+    if any(not isinstance(text, str) or not text.strip() for text in rubric.values()):
+        raise ValueError(
+            f"Question {question.question_id!r} has an invalid rubric description."
+        )
+    try:
+        concepts_json = json.dumps(
+            concepts,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        rubric_json = json.dumps(
+            rubric,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        parsed_concepts = json.loads(concepts_json)
+        parsed_rubric = json.loads(rubric_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Question {question.question_id!r} contains invalid JSON data."
+        ) from exc
+
+    if parsed_concepts != list(concepts) or parsed_rubric != rubric:
+        raise ValueError(
+            f"Question {question.question_id!r} JSON data failed round-trip validation."
+        )
+    return concepts_json, rubric_json
+
+
+def _question_row(question: AssessmentQuestion) -> tuple[object, ...]:
+    """Validate a bank question and map it to its database row values."""
+    question_id = question.question_id
+    if not isinstance(question_id, str) or not question_id.strip():
+        raise ValueError("Every question must have a non-empty question ID.")
+    if not isinstance(question.trade, Trade) or not isinstance(question.difficulty, Difficulty):
+        raise ValueError(f"Question {question_id!r} has invalid trade or difficulty.")
+    for field in (
+        "skill_tag",
+        "question_text_en",
+        "question_text_te",
+        "question_text_hi",
+    ):
+        value = getattr(question, field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Question {question_id!r} has invalid {field}.")
+    for field in (
+        "safety_critical",
+        "active",
+        "telugu_review_required",
+        "hindi_review_required",
+    ):
+        if type(getattr(question, field)) is not bool:
+            raise ValueError(f"Question {question_id!r} has invalid Boolean field {field}.")
+
+    expected_concepts_json, rubric_json = _serialize_question_json(question)
+    return (
+        question_id,
+        question.trade.value,
+        question.difficulty.value,
+        question.skill_tag,
+        question.question_text_en,
+        question.question_text_te,
+        question.question_text_hi,
+        expected_concepts_json,
+        rubric_json,
+        int(question.safety_critical),
+        int(question.active),
+        int(question.telugu_review_required),
+        int(question.hindi_review_required),
+    )
+
+
+def _seed_question_bank(connection: sqlite3.Connection) -> None:
+    """Seed missing question IDs, rejecting any existing content conflict."""
+    try:
+        validate_question_bank(QUESTION_BANK)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid assessment question bank: {exc}") from exc
+
+    rows = [
+        _question_row(question)
+        for trade in (Trade.ELECTRICIAN, Trade.PLUMBER)
+        for difficulty in (
+            Difficulty.FOUNDATIONAL,
+            Difficulty.INTERMEDIATE,
+            Difficulty.ADVANCED,
+        )
+        for question in QUESTION_BANK[trade][difficulty]
+    ]
+
+    select_sql = (
+        "SELECT "
+        + ", ".join(_QUESTION_COLUMNS[1:])
+        + " FROM questions WHERE question_id = ?"
+    )
+    insert_sql = (
+        "INSERT INTO questions ("
+        + ", ".join(_QUESTION_COLUMNS)
+        + ") VALUES ("
+        + ", ".join("?" for _ in _QUESTION_COLUMNS)
+        + ")"
+    )
+    for row in rows:
+        existing = connection.execute(select_sql, (row[0],)).fetchone()
+        if existing is not None:
+            if tuple(existing) != row[1:]:
+                raise ValueError(
+                    f"Question ID {row[0]!r} already exists with different content."
+                )
+            continue
+        connection.execute(insert_sql, row)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_assessment_schema", _create_assessment_schema),
+    Migration(2, "seed_assessment_question_bank", _seed_question_bank),
 )
 
 

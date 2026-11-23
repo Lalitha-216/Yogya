@@ -1,13 +1,18 @@
 """Tests for versioned SQLite migration infrastructure."""
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
+from dataclasses import replace
 import json
 import sqlite3
 from threading import Barrier, Lock
 
 import pytest
 
+import migrations as migration_module
 import main
+from assessment.adaptive_engine import Difficulty, Trade
+from assessment.question_bank import QUESTION_BANK
 from migrations import MIGRATIONS, Migration, apply_migrations
 
 
@@ -41,6 +46,11 @@ def insert_worker(connection):
 
 
 def insert_question(connection, question_id="E01"):
+    if connection.execute(
+        "SELECT 1 FROM questions WHERE question_id = ?",
+        (question_id,),
+    ).fetchone():
+        return
     connection.execute(
         """
         INSERT INTO questions (
@@ -310,7 +320,7 @@ def test_init_db_preserves_existing_worker_tables_and_records(tmp_path, monkeypa
         ).fetchall() == before_skills
         assert connection.execute(
             "SELECT version FROM schema_migrations"
-        ).fetchall() == [(MIGRATIONS[0].version,)]
+        ).fetchall() == [(migration.version,) for migration in MIGRATIONS]
         assert connection.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
@@ -558,13 +568,236 @@ def test_assessment_schema_migration_is_registered_once_on_repeated_init(
             "SELECT version, name, applied_at FROM schema_migrations"
         ).fetchall() == first_record
         assert first_record == [
-            (MIGRATIONS[0].version, MIGRATIONS[0].name, first_record[0][2])
+            (migration.version, migration.name, applied_at)
+            for (migration, (_, _, applied_at)) in zip(MIGRATIONS, first_record)
         ]
+        assert len(first_record) == len(MIGRATIONS)
         assert connection.execute(
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name IN "
             "('questions', 'assessments', 'assessment_questions', 'assessment_answers')"
         ).fetchone() == (4,)
+
+
+def test_question_seed_migration_inserts_24_questions_with_expected_trade_counts(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        rows = connection.execute(
+            "SELECT question_id, trade FROM questions ORDER BY question_id"
+        ).fetchall()
+        assert len(rows) == 24
+        assert sum(trade == Trade.ELECTRICIAN.value for _, trade in rows) == 12
+        assert sum(trade == Trade.PLUMBER.value for _, trade in rows) == 12
+        assert {version for version, in connection.execute(
+            "SELECT version FROM schema_migrations"
+        )} == {1, 2}
+    finally:
+        connection.close()
+
+
+def test_question_seed_migration_maps_fields_and_round_trips_json(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        actual_questions = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                """
+                SELECT question_id, trade, difficulty, skill_tag, question_text_en,
+                       question_text_te, question_text_hi, expected_concepts_json,
+                       rubric_json, safety_critical, active, telugu_review_required,
+                       hindi_review_required
+                FROM questions
+                """
+            )
+        }
+        expected_count = 0
+        for trade in (Trade.ELECTRICIAN, Trade.PLUMBER):
+            for difficulty in (
+                Difficulty.FOUNDATIONAL,
+                Difficulty.INTERMEDIATE,
+                Difficulty.ADVANCED,
+            ):
+                for question in QUESTION_BANK[trade][difficulty]:
+                    expected_count += 1
+                    expected_concepts_json = json.dumps(
+                        question.expected_concepts,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                    rubric_json = json.dumps(
+                        question.rubric_json,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    assert actual_questions[question.question_id] == (
+                        question.trade.value,
+                        question.difficulty.value,
+                        question.skill_tag,
+                        question.question_text_en,
+                        question.question_text_te,
+                        question.question_text_hi,
+                        expected_concepts_json,
+                        rubric_json,
+                        int(question.safety_critical),
+                        int(question.active),
+                        int(question.telugu_review_required),
+                        int(question.hindi_review_required),
+                    )
+                    assert json.loads(expected_concepts_json) == list(question.expected_concepts)
+                    assert json.loads(rubric_json) == question.rubric_json
+        assert expected_count == 24
+        assert len(actual_questions) == expected_count
+    finally:
+        connection.close()
+
+
+def test_question_seed_migration_is_idempotent_on_repeated_initialization(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        original_questions = connection.execute(
+            "SELECT * FROM questions ORDER BY question_id"
+        ).fetchall()
+        original_migrations = connection.execute(
+            "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    main.init_db()
+
+    connection = open_database(database_path)
+    try:
+        assert connection.execute(
+            "SELECT * FROM questions ORDER BY question_id"
+        ).fetchall() == original_questions
+        assert connection.execute(
+            "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall() == original_migrations
+    finally:
+        connection.close()
+
+
+def test_matching_existing_question_content_is_skipped(tmp_path, monkeypatch):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    question = QUESTION_BANK[Trade.ELECTRICIAN][Difficulty.FOUNDATIONAL][0]
+    connection = open_database(database_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM questions WHERE question_id = ?",
+            (question.question_id,),
+        ).fetchone()
+        connection.execute("DELETE FROM questions")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute(
+            """
+            INSERT INTO questions (
+                question_id, trade, difficulty, skill_tag, question_text_en,
+                question_text_te, question_text_hi, expected_concepts_json,
+                rubric_json, safety_critical, active, telugu_review_required,
+                hindi_review_required
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            row,
+        )
+        connection.commit()
+
+        apply_migrations(connection, MIGRATIONS[1:])
+
+        assert connection.execute("SELECT COUNT(*) FROM questions").fetchone() == (24,)
+        assert connection.execute(
+            "SELECT * FROM questions WHERE question_id = ?",
+            (question.question_id,),
+        ).fetchone() == row
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,)]
+    finally:
+        connection.close()
+
+
+def test_conflicting_question_content_raises_and_rolls_back_seed_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    question = QUESTION_BANK[Trade.PLUMBER][Difficulty.ADVANCED][-1]
+    connection = open_database(database_path)
+    try:
+        question_row = connection.execute(
+            "SELECT * FROM questions WHERE question_id = ?",
+            (question.question_id,),
+        ).fetchone()
+        conflicting_row = (*question_row[:4], "Conflicting question text", *question_row[5:])
+        connection.execute("DELETE FROM questions")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute(
+            """
+            INSERT INTO questions (
+                question_id, trade, difficulty, skill_tag, question_text_en,
+                question_text_te, question_text_hi, expected_concepts_json,
+                rubric_json, safety_critical, active, telugu_review_required,
+                hindi_review_required
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            conflicting_row,
+        )
+        connection.commit()
+
+        with pytest.raises(ValueError, match=r"Question ID 'P12'.*different content"):
+            apply_migrations(connection, MIGRATIONS[1:])
+
+        assert connection.execute("SELECT * FROM questions").fetchall() == [
+            conflicting_row
+        ]
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,)]
+    finally:
+        connection.close()
+
+
+def test_invalid_question_data_is_rejected_without_partial_seed(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    invalid_bank = deepcopy(QUESTION_BANK)
+    question = invalid_bank[Trade.ELECTRICIAN][Difficulty.FOUNDATIONAL][0]
+    invalid_questions = list(invalid_bank[Trade.ELECTRICIAN][Difficulty.FOUNDATIONAL])
+    invalid_questions[0] = replace(question, expected_concepts=())
+    invalid_bank[Trade.ELECTRICIAN][Difficulty.FOUNDATIONAL] = tuple(invalid_questions)
+    monkeypatch.setattr(migration_module, "QUESTION_BANK", invalid_bank)
+
+    connection = open_database(database_path)
+    try:
+        connection.execute("DELETE FROM questions")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.commit()
+
+        with pytest.raises(ValueError, match="has no expected concepts"):
+            apply_migrations(connection, MIGRATIONS[1:])
+
+        assert connection.execute("SELECT COUNT(*) FROM questions").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,)]
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -837,17 +1070,6 @@ def test_duplicate_question_assignment_and_answer_are_rejected(tmp_path, monkeyp
     try:
         worker_id = insert_worker(connection)
         insert_question(connection)
-        connection.execute(
-            """
-            INSERT INTO questions (
-                question_id, trade, difficulty, skill_tag, question_text_en,
-                question_text_te, question_text_hi, expected_concepts_json,
-                rubric_json, safety_critical, active, telugu_review_required,
-                hindi_review_required
-            ) VALUES ('E02', 'Electrician', 'FOUNDATIONAL', 'Tag', 'English',
-                      'Telugu', 'Hindi', '[]', '{}', 0, 1, 1, 1)
-            """
-        )
         assessment_id = insert_assessment(connection, worker_id)
         insert_selection(connection, assessment_id, "E01", question_order=1)
         with pytest.raises(sqlite3.IntegrityError):
