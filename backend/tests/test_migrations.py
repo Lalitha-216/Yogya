@@ -1,13 +1,14 @@
 """Tests for versioned SQLite migration infrastructure."""
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
 from threading import Barrier, Lock
 
 import pytest
 
 import main
-from migrations import Migration, apply_migrations
+from migrations import MIGRATIONS, Migration, apply_migrations
 
 
 def open_database(path):
@@ -16,6 +17,146 @@ def open_database(path):
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     return connection
+
+
+def initialize_assessment_database(tmp_path, monkeypatch):
+    """Initialize an isolated database with the existing application schema."""
+    database_path = tmp_path / "assessment-schema.db"
+    monkeypatch.setattr(main, "DB_PATH", database_path)
+    main.init_db()
+    return database_path
+
+
+def insert_worker(connection):
+    cursor = connection.execute(
+        """
+        INSERT INTO workers (
+            name, language, location, raw_transcript, trade,
+            experience_years, evidence_level
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("Schema Test Worker", "en", "", "sample", "Electrician", 2, "SELF_REPORTED"),
+    )
+    return cursor.lastrowid
+
+
+def insert_question(connection, question_id="E01"):
+    connection.execute(
+        """
+        INSERT INTO questions (
+            question_id, trade, difficulty, skill_tag, question_text_en,
+            question_text_te, question_text_hi, expected_concepts_json,
+            rubric_json, safety_critical, active, telugu_review_required,
+            hindi_review_required
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            question_id,
+            "Electrician",
+            "FOUNDATIONAL",
+            "Electrical safety",
+            "Question in English",
+            "ప్రశ్న",
+            "प्रश्न",
+            json.dumps(["concept"]),
+            json.dumps({str(level): f"level {level}" for level in range(5)}),
+            1,
+            1,
+            1,
+            1,
+        ),
+    )
+
+
+def insert_assessment(connection, worker_id, *, assessment_id=None, status="IN_PROGRESS"):
+    fields = """
+        worker_id, trade, language, status, current_stage, total_score,
+        max_score, score_percentage, safety_flags_json, started_at, completed_at
+    """
+    values = (
+        worker_id,
+        "Electrician",
+        "en",
+        status,
+        1,
+        None,
+        24,
+        None,
+        "[]",
+        "2026-01-01T00:00:00+00:00",
+        None,
+    )
+    if assessment_id is None:
+        cursor = connection.execute(
+            f"INSERT INTO assessments ({fields}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            values,
+        )
+    else:
+        cursor = connection.execute(
+            f"INSERT INTO assessments (id, {fields}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (assessment_id, *values),
+        )
+    return cursor.lastrowid
+
+
+def insert_selection(
+    connection,
+    assessment_id,
+    question_id="E01",
+    *,
+    stage_number=1,
+    question_order=1,
+):
+    return connection.execute(
+        """
+        INSERT INTO assessment_questions (
+            assessment_id, question_id, stage_number, question_order,
+            selection_reason, selected_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            assessment_id,
+            question_id,
+            stage_number,
+            question_order,
+            "Initial stage selection",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    ).lastrowid
+
+
+def insert_answer(
+    connection,
+    assessment_id,
+    question_id="E01",
+    *,
+    stage_number=1,
+    answer_source="TEXT",
+    score=3,
+):
+    return connection.execute(
+        """
+        INSERT INTO assessment_answers (
+            assessment_id, question_id, stage_number, answer_text,
+            answer_source, score, rubric_feedback_json, safety_flag,
+            safety_reason, safety_concerns_json, answered_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            assessment_id,
+            question_id,
+            stage_number,
+            "Worker answer",
+            answer_source,
+            score,
+            json.dumps({"feedback": "Valid feedback"}),
+            0,
+            None,
+            "[]",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    ).lastrowid
 
 
 def test_apply_migrations_creates_tracking_table_and_records_version(tmp_path):
@@ -169,11 +310,19 @@ def test_init_db_preserves_existing_worker_tables_and_records(tmp_path, monkeypa
         ).fetchall() == before_skills
         assert connection.execute(
             "SELECT version FROM schema_migrations"
-        ).fetchall() == []
+        ).fetchall() == [(MIGRATIONS[0].version,)]
         assert connection.execute(
             "SELECT name FROM sqlite_master "
             "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        ).fetchall() == [("schema_migrations",), ("worker_skills",), ("workers",)]
+        ).fetchall() == [
+            ("assessment_answers",),
+            ("assessment_questions",),
+            ("assessments",),
+            ("questions",),
+            ("schema_migrations",),
+            ("worker_skills",),
+            ("workers",),
+        ]
 
 
 def test_init_db_preserves_legacy_tables_and_records_created_before_initialization(
@@ -279,3 +428,523 @@ def test_concurrent_migration_execution_uses_independent_connections(tmp_path):
         ).fetchall() == [(1, "create_marker")]
     finally:
         verification_connection.close()
+
+
+EXPECTED_ASSESSMENT_COLUMNS = {
+    "questions": {
+        "question_id", "trade", "difficulty", "skill_tag", "question_text_en",
+        "question_text_te", "question_text_hi", "expected_concepts_json",
+        "rubric_json", "safety_critical", "active", "telugu_review_required",
+        "hindi_review_required",
+    },
+    "assessments": {
+        "id", "worker_id", "trade", "language", "status", "current_stage",
+        "total_score", "max_score", "score_percentage", "safety_flags_json",
+        "started_at", "completed_at",
+    },
+    "assessment_questions": {
+        "id", "assessment_id", "question_id", "stage_number", "question_order",
+        "selection_reason", "selected_at",
+    },
+    "assessment_answers": {
+        "id", "assessment_id", "question_id", "stage_number", "answer_text",
+        "answer_source", "score", "rubric_feedback_json", "safety_flag",
+        "safety_reason", "safety_concerns_json", "answered_at",
+    },
+}
+
+
+def test_assessment_schema_migration_creates_four_tables_and_expected_columns(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "questions",
+            "assessments",
+            "assessment_questions",
+            "assessment_answers",
+        } <= table_names
+
+        for table_name, expected_columns in EXPECTED_ASSESSMENT_COLUMNS.items():
+            columns = {
+                row[1]: (row[2], row[3], row[4], row[5])
+                for row in connection.execute(f'PRAGMA table_info("{table_name}")')
+            }
+            assert set(columns) == expected_columns
+
+        assert columns["score"][0:2] == ("INTEGER", 1)
+        assessment_columns = {
+            row[1]: (row[2], row[3], row[4], row[5])
+            for row in connection.execute("PRAGMA table_info(assessments)")
+        }
+        assert assessment_columns["max_score"] == ("INTEGER", 1, "24", 0)
+        assert assessment_columns["score_percentage"][0] == "REAL"
+    finally:
+        connection.close()
+
+
+def test_assessment_schema_declares_restrictive_foreign_keys_and_indexes(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        question_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(assessment_questions)"
+        ).fetchall()
+        assert {(row[2], row[3], row[4], row[6]) for row in question_foreign_keys} == {
+            ("assessments", "assessment_id", "id", "RESTRICT"),
+            ("questions", "question_id", "question_id", "RESTRICT"),
+        }
+
+        answer_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(assessment_answers)"
+        ).fetchall()
+        assert len(answer_foreign_keys) == 4
+        assert all(row[6] == "RESTRICT" for row in answer_foreign_keys)
+        assert {
+            (row[2], row[3], row[4])
+            for row in answer_foreign_keys
+        } >= {
+            ("assessments", "assessment_id", "id"),
+            ("questions", "question_id", "question_id"),
+            ("assessment_questions", "assessment_id", "assessment_id"),
+            ("assessment_questions", "question_id", "question_id"),
+        }
+        assert connection.execute(
+            "PRAGMA foreign_key_list(assessments)"
+        ).fetchone()[6] == "RESTRICT"
+
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert {
+            "idx_assessments_worker_history",
+            "idx_assessment_questions_ordered",
+            "idx_assessment_answers_stage",
+            "idx_questions_selection",
+        } <= indexes
+    finally:
+        connection.close()
+
+
+def test_assessment_schema_migration_is_registered_once_on_repeated_init(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    with main.db() as connection:
+        first_record = connection.execute(
+            "SELECT version, name, applied_at FROM schema_migrations"
+        ).fetchall()
+
+    main.init_db()
+
+    with main.db() as connection:
+        assert connection.execute(
+            "SELECT version, name, applied_at FROM schema_migrations"
+        ).fetchall() == first_record
+        assert first_record == [
+            (MIGRATIONS[0].version, MIGRATIONS[0].name, first_record[0][2])
+        ]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name IN "
+            "('questions', 'assessments', 'assessment_questions', 'assessment_answers')"
+        ).fetchone() == (4,)
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("trade", "Carpenter"),
+        ("difficulty", "EXPERT"),
+        ("safety_critical", 2),
+        ("active", 1.5),
+        ("active", -1),
+        ("telugu_review_required", 2),
+        ("hindi_review_required", -1),
+    ],
+)
+def test_questions_check_constraints_reject_invalid_values(
+    tmp_path,
+    monkeypatch,
+    column,
+    invalid_value,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        values = {
+            "question_id": "E-invalid",
+            "trade": "Electrician",
+            "difficulty": "FOUNDATIONAL",
+            "skill_tag": "Tag",
+            "question_text_en": "English",
+            "question_text_te": "Telugu",
+            "question_text_hi": "Hindi",
+            "expected_concepts_json": "[]",
+            "rubric_json": "{}",
+            "safety_critical": 0,
+            "active": 1,
+            "telugu_review_required": 1,
+            "hindi_review_required": 1,
+        }
+        values[column] = invalid_value
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO questions ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("trade", "Carpenter"),
+        ("language", "fr"),
+        ("status", "PENDING"),
+        ("current_stage", 0),
+        ("current_stage", 1.5),
+        ("total_score", 25),
+        ("max_score", 23),
+        ("score_percentage", 100.1),
+        ("score_percentage", "not-a-number"),
+        ("safety_flags_json", "{invalid"),
+    ],
+)
+def test_assessments_check_constraints_reject_invalid_values(
+    tmp_path,
+    monkeypatch,
+    column,
+    invalid_value,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        values = {
+            "worker_id": worker_id,
+            "trade": "Electrician",
+            "language": "en",
+            "status": "IN_PROGRESS",
+            "current_stage": 1,
+            "max_score": 24,
+            "safety_flags_json": "[]",
+            "started_at": "2026-01-01T00:00:00+00:00",
+        }
+        values[column] = invalid_value
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO assessments ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "total_score", "score_percentage", "completed_at"),
+    [
+        ("COMPLETED", None, 50.0, "2026-01-02T00:00:00+00:00"),
+        ("COMPLETED", 12, None, "2026-01-02T00:00:00+00:00"),
+        ("COMPLETED", 12, 50.0, None),
+        ("IN_PROGRESS", 12, 50.0, "2026-01-02T00:00:00+00:00"),
+        ("ABANDONED", 12, None, None),
+    ],
+)
+def test_assessments_enforce_final_score_status_consistency(
+    tmp_path,
+    monkeypatch,
+    status,
+    total_score,
+    score_percentage,
+    completed_at,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO assessments (
+                    worker_id, trade, language, status, current_stage, total_score,
+                    max_score, score_percentage, safety_flags_json, started_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 24, ?, '[]', ?, ?)
+                """,
+                (
+                    worker_id,
+                    "Electrician",
+                    "en",
+                    status,
+                    3,
+                    total_score,
+                    score_percentage,
+                    "2026-01-01T00:00:00+00:00",
+                    completed_at,
+                ),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("stage_number", 4),
+        ("stage_number", 1.5),
+        ("question_order", 7),
+        ("question_order", 1.5),
+    ],
+)
+def test_assessment_question_check_constraints_reject_invalid_values(
+    tmp_path,
+    monkeypatch,
+    column,
+    invalid_value,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        insert_question(connection)
+        assessment_id = insert_assessment(connection, worker_id)
+        values = {
+            "assessment_id": assessment_id,
+            "question_id": "E01",
+            "stage_number": 1,
+            "question_order": 1,
+            "selection_reason": "Initial selection",
+            "selected_at": "2026-01-01T00:00:00+00:00",
+        }
+        values[column] = invalid_value
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO assessment_questions ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("stage_number", 0),
+        ("stage_number", 1.5),
+        ("answer_source", "AUDIO"),
+        ("score", 5),
+        ("score", 3.5),
+        ("safety_flag", 2),
+    ],
+)
+def test_assessment_answer_check_constraints_reject_invalid_values(
+    tmp_path,
+    monkeypatch,
+    column,
+    invalid_value,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        insert_question(connection)
+        assessment_id = insert_assessment(connection, worker_id)
+        insert_selection(connection, assessment_id)
+        values = {
+            "assessment_id": assessment_id,
+            "question_id": "E01",
+            "stage_number": 1,
+            "answer_text": "Answer",
+            "answer_source": "TEXT",
+            "score": 3,
+            "rubric_feedback_json": '{"feedback": "ok"}',
+            "safety_flag": 0,
+            "safety_reason": None,
+            "safety_concerns_json": "[]",
+            "answered_at": "2026-01-01T00:00:00+00:00",
+        }
+        values[column] = invalid_value
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                f"INSERT INTO assessment_answers ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+    finally:
+        connection.close()
+
+
+def test_foreign_keys_reject_missing_worker_and_question(tmp_path, monkeypatch):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_assessment(connection, worker_id=999)
+
+        worker_id = insert_worker(connection)
+        assessment_id = insert_assessment(connection, worker_id)
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_selection(connection, assessment_id, "missing-question")
+    finally:
+        connection.close()
+
+
+def test_composite_foreign_key_rejects_answer_for_unselected_question(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        insert_question(connection)
+        assessment_id = insert_assessment(connection, worker_id)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_answer(connection, assessment_id)
+    finally:
+        connection.close()
+
+
+def test_duplicate_question_assignment_and_answer_are_rejected(tmp_path, monkeypatch):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        insert_question(connection)
+        connection.execute(
+            """
+            INSERT INTO questions (
+                question_id, trade, difficulty, skill_tag, question_text_en,
+                question_text_te, question_text_hi, expected_concepts_json,
+                rubric_json, safety_critical, active, telugu_review_required,
+                hindi_review_required
+            ) VALUES ('E02', 'Electrician', 'FOUNDATIONAL', 'Tag', 'English',
+                      'Telugu', 'Hindi', '[]', '{}', 0, 1, 1, 1)
+            """
+        )
+        assessment_id = insert_assessment(connection, worker_id)
+        insert_selection(connection, assessment_id, "E01", question_order=1)
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_selection(connection, assessment_id, "E01", question_order=2)
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_selection(connection, assessment_id, "E02", question_order=1)
+
+        insert_answer(connection, assessment_id, "E01")
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_answer(connection, assessment_id, "E01")
+    finally:
+        connection.close()
+
+
+def test_foreign_key_deletions_are_restricted(tmp_path, monkeypatch):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        worker_id = insert_worker(connection)
+        insert_question(connection)
+        assessment_id = insert_assessment(connection, worker_id)
+        insert_selection(connection, assessment_id)
+        insert_answer(connection, assessment_id)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM assessments WHERE id = ?", (assessment_id,))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("DELETE FROM questions WHERE question_id = 'E01'")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM assessment_questions "
+                "WHERE assessment_id = ? AND question_id = 'E01'",
+                (assessment_id,),
+            )
+    finally:
+        connection.close()
+
+
+def test_json_checks_are_added_only_when_sqlite_json_valid_is_supported(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        json_supported = connection.execute(
+            "SELECT json_valid(?), json_valid(?)",
+            ("{}", "{invalid"),
+        ).fetchone() == (1, 0)
+        if json_supported:
+            worker_id = insert_worker(connection)
+            values = (
+                "E-invalid-json", "Electrician", "FOUNDATIONAL", "Tag",
+                "English", "Telugu", "Hindi", "{invalid", "{}", 0, 1, 1, 1,
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO questions (
+                        question_id, trade, difficulty, skill_tag, question_text_en,
+                        question_text_te, question_text_hi, expected_concepts_json,
+                        rubric_json, safety_critical, active, telugu_review_required,
+                        hindi_review_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            assert worker_id > 0
+        else:
+            schema_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='questions'"
+            ).fetchone()[0]
+            assert "json_valid" not in schema_sql
+    finally:
+        connection.close()
+
+
+def test_failed_followup_migration_rolls_back_assessment_schema(tmp_path):
+    connection = open_database(tmp_path / "schema-rollback.db")
+
+    def fail_after_schema_creation(conn):
+        raise RuntimeError("forced migration failure")
+
+    try:
+        with pytest.raises(RuntimeError, match="forced migration failure"):
+            apply_migrations(
+                connection,
+                [MIGRATIONS[0], Migration(2, "forced_failure", fail_after_schema_creation)],
+            )
+
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('schema_migrations', 'questions', 'assessments', "
+            "'assessment_questions', 'assessment_answers')"
+        ).fetchall() == []
+        assert not connection.in_transaction
+    finally:
+        connection.close()
