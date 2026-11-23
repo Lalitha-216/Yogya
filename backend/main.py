@@ -14,6 +14,8 @@ from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
 
+from migrations import apply_migrations
+
 logger = logging.getLogger("yogya")
 
 # --- Configuration -----------------------------------------------------------
@@ -125,8 +127,9 @@ class DiscoverRequest(BaseModel):
 # --- Database ----------------------------------------------------------------
 @contextmanager
 def db() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -164,6 +167,7 @@ def init_db() -> None:
             )
             """
         )
+        apply_migrations(conn)
 
 
 @asynccontextmanager
