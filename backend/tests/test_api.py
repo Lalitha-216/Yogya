@@ -647,3 +647,260 @@ def test_results_before_completion_returns_conflict(client, tmp_path):
         f"/api/assessments/{assessment['assessment_id']}/results"
     )
     assert response.status_code == 409
+
+
+def test_passport_unknown_worker_returns_404(client):
+    response = client.get("/api/workers/9999/passport")
+    assert response.status_code == 404
+
+
+def test_passport_without_assessment_is_valid_and_has_empty_evidence(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+
+    response = client.get(f"/api/workers/{worker_id}/passport")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["worker_profile"]["worker_id"] == worker_id
+    assert data["assessment_summary"]["status"] == "NO_ASSESSMENT"
+    assert data["assessment_summary"]["total_score"] is None
+    assert data["assessment_evidence"]["demonstrated_concepts"] == []
+    assert data["assessment_evidence"]["relevant_feedback"] == []
+    assert data["assessment_evidence"]["safety"]["concerns"] == []
+    assert "raw_transcript" not in str(data)
+
+
+def test_passport_with_in_progress_assessment_uses_empty_assessment_evidence(
+    client,
+    tmp_path,
+):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+
+    response = client.get(f"/api/workers/{worker_id}/passport")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["assessment_summary"]["assessment_id"] == assessment["assessment_id"]
+    assert data["assessment_summary"]["status"] == "IN_PROGRESS"
+    assert data["assessment_summary"]["total_score"] is None
+    assert data["assessment_evidence"]["demonstrated_concepts"] == []
+
+
+def test_passport_completed_assessment_includes_persisted_evidence(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            UPDATE worker_skills
+            SET evidence_level = 'SELF_REPORTED'
+            WHERE worker_id = ?
+            """,
+            (worker_id,),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO assessments (
+                worker_id, trade, language, status, current_stage,
+                total_score, max_score, score_percentage, safety_flags_json,
+                started_at, completed_at
+            ) VALUES (?, 'Electrician', 'en', 'COMPLETED', 3,
+                      18, 24, 75.0, ?, ?, ?)
+            """,
+            (
+                worker_id,
+                '{"safety_critical_misconception":true,"concerns":[]}',
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-02T00:00:00+00:00",
+            ),
+        )
+        assessment_id = cursor.lastrowid
+        conn.execute(
+            """
+            INSERT INTO assessment_questions (
+                assessment_id, question_id, stage_number, question_order,
+                selection_reason, selected_at
+            ) VALUES (?, 'E03', 1, 1, 'Test selection',
+                      '2026-01-01T00:00:00+00:00')
+            """,
+            (assessment_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO assessment_answers (
+                assessment_id, question_id, stage_number, answer_text,
+                answer_source, score, rubric_feedback_json, safety_flag,
+                safety_reason, safety_concerns_json, answered_at
+            ) VALUES (?, 'E03', 1, 'Test answer', 'TEXT', 4, ?, 1,
+                      'Unsafe working practice',
+                      '[{"concern":"Working while live","evidence":"power is on"}]',
+                      '2026-01-02T00:00:00+00:00')
+            """,
+            (
+                assessment_id,
+                '{"feedback":"Accurate isolation explanation","concept_evaluations":[{"concept":"supply must be isolated","demonstrated":true,"evidence":"isolate the supply","rationale":"The answer demonstrates isolation"}]}',
+            ),
+        )
+        conn.commit()
+
+    response = client.get(f"/api/workers/{worker_id}/passport")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["assessment_summary"]["assessment_id"] == assessment_id
+    assert data["assessment_summary"]["status"] == "COMPLETED"
+    assert data["assessment_summary"]["total_score"] == 18
+    assert data["assessment_summary"]["maximum_score"] == 24
+    assert data["assessment_summary"]["percentage"] == 75.0
+    assert data["assessment_summary"]["completion_date"] == "2026-01-02T00:00:00+00:00"
+    assert len(data["assessment_evidence"]["demonstrated_concepts"]) == 1
+    assert len(data["assessment_evidence"]["relevant_feedback"]) == 1
+    assert data["assessment_evidence"]["safety"]["safety_critical_misconception"] is True
+    assert len(data["assessment_evidence"]["safety"]["concerns"]) == 1
+    assessed_skills = [
+        skill
+        for skill in data["recognized_skills"]
+        if skill["evidence_level"] == "ASSESSED"
+    ]
+    assert assessed_skills
+    assert any(
+        skill["skill_name"] == "Electrical safety"
+        for skill in assessed_skills
+    )
+
+
+def test_passport_multiple_assessments_selects_latest_completed(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            INSERT INTO assessments (
+                worker_id, trade, language, status, current_stage,
+                total_score, max_score, score_percentage, safety_flags_json,
+                started_at, completed_at
+            ) VALUES (?, 'Electrician', 'en', 'COMPLETED', 3,
+                      12, 24, 50.0, '[]',
+                      '2026-01-01T00:00:00+00:00',
+                      '2026-01-02T00:00:00+00:00')
+            """,
+            (worker_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO assessments (
+                worker_id, trade, language, status, current_stage,
+                max_score, safety_flags_json, started_at
+            ) VALUES (?, 'Electrician', 'en', 'IN_PROGRESS', 1,
+                      24, '[]', '2026-02-01T00:00:00+00:00')
+            """,
+            (worker_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO assessments (
+                worker_id, trade, language, status, current_stage,
+                total_score, max_score, score_percentage, safety_flags_json,
+                started_at, completed_at
+            ) VALUES (?, 'Electrician', 'en', 'COMPLETED', 3,
+                      21, 24, 87.5, '[]',
+                      '2026-01-03T00:00:00+00:00',
+                      '2026-01-04T00:00:00+00:00')
+            """,
+            (worker_id,),
+        )
+        conn.commit()
+
+    response = client.get(f"/api/workers/{worker_id}/passport")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["assessment_summary"]["total_score"] == 21
+    assert data["assessment_summary"]["percentage"] == 87.5
+    assert data["assessment_summary"]["completion_date"] == "2026-01-04T00:00:00+00:00"
+
+
+def test_passport_preserves_evidence_levels_and_never_invented_verification(
+    client,
+    tmp_path,
+):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO assessments (
+                worker_id, trade, language, status, current_stage,
+                total_score, max_score, score_percentage, safety_flags_json,
+                started_at, completed_at
+            ) VALUES (?, 'Electrician', 'en', 'COMPLETED', 3,
+                      24, 24, 100.0, '[]',
+                      '2026-01-01T00:00:00+00:00',
+                      '2026-01-02T00:00:00+00:00')
+            """,
+            (worker_id,),
+        )
+        assessment_id = cursor.lastrowid
+        conn.execute(
+            """
+            INSERT INTO assessment_questions (
+                assessment_id, question_id, stage_number, question_order,
+                selection_reason, selected_at
+            ) VALUES (?, 'E03', 1, 1, 'High-score assessment',
+                      '2026-01-01T00:00:00+00:00')
+            """,
+            (assessment_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO assessment_answers (
+                assessment_id, question_id, stage_number, answer_text,
+                answer_source, score, rubric_feedback_json, safety_flag,
+                safety_reason, safety_concerns_json, answered_at
+            ) VALUES (?, 'E03', 1, 'I isolate supply and verify no voltage',
+                      'TEXT', 4,
+                      '{"feedback":"Accurate safety procedure","concept_evaluations":[{"concept":"supply must be isolated","demonstrated":true,"evidence":"isolate supply","rationale":"The answer demonstrates isolation"}]}',
+                      0, NULL, '[]',
+                      '2026-01-02T00:00:00+00:00')
+            """,
+            (assessment_id,),
+        )
+        conn.commit()
+
+    response = client.get(f"/api/workers/{worker_id}/passport")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert all(
+        skill["evidence_level"] != "INDEPENDENTLY_VERIFIED"
+        for skill in data["recognized_skills"]
+    )
+    assessed = [
+        skill
+        for skill in data["recognized_skills"]
+        if skill["evidence_level"] == "ASSESSED"
+    ]
+    assert assessed
+    assert any(
+        skill["skill_name"] == "Electrical safety"
+        for skill in assessed
+    )
+    assert any(
+        skill["evidence_level"] == "SELF_REPORTED"
+        for skill in data["recognized_skills"]
+    )
+    classifications = data["evidence_classification"]
+    assert "SELF_REPORTED" in classifications
+    assert "ASSESSED" in classifications
+    assert "INDEPENDENTLY_VERIFIED" in classifications
+
+
+def test_passport_does_not_expose_raw_worker_transcript(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+
+    response = client.get(f"/api/workers/{worker_id}/passport")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "raw_transcript" not in str(payload)

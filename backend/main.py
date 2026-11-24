@@ -387,6 +387,276 @@ def get_worker(worker_id: int) -> dict:
     }
 
 
+def parse_passport_json(value: str, field_name: str) -> dict | list:
+    """Parse persisted passport JSON without exposing malformed database values."""
+    if not isinstance(value, str):
+        return {} if field_name == "rubric_feedback_json" else []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        logger.error("Malformed persisted JSON in passport field %s.", field_name)
+        return {} if field_name == "rubric_feedback_json" else []
+    if field_name == "rubric_feedback_json" and isinstance(parsed, dict):
+        return parsed
+    if field_name != "rubric_feedback_json" and isinstance(parsed, list):
+        return parsed
+    return {} if field_name == "rubric_feedback_json" else []
+
+
+@app.get("/api/workers/{worker_id}/passport")
+def get_worker_passport(worker_id: int) -> dict:
+    """Generate a read-only digital passport from persisted worker and assessment data."""
+    if type(worker_id) is not int or worker_id <= 0:
+        raise HTTPException(status_code=422, detail="Invalid worker_id.")
+
+    with db() as conn:
+        worker = conn.execute(
+            """
+            SELECT id, name, language, location, trade,
+                   experience_years, evidence_level
+            FROM workers
+            WHERE id = ?
+            """,
+            (worker_id,),
+        ).fetchone()
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Worker not found")
+
+        worker_skills = conn.execute(
+            """
+            SELECT skill_name, evidence_level
+            FROM worker_skills
+            WHERE worker_id = ?
+            ORDER BY id
+            """,
+            (worker_id,),
+        ).fetchall()
+
+        completed_assessment = conn.execute(
+            """
+            SELECT id, status, total_score, max_score, score_percentage,
+                   completed_at
+            FROM assessments
+            WHERE worker_id = ? AND status = 'COMPLETED'
+            ORDER BY completed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (worker_id,),
+        ).fetchone()
+
+        latest_noncompleted = None
+        if completed_assessment is None:
+            latest_noncompleted = conn.execute(
+                """
+                SELECT id, status, current_stage, started_at
+                FROM assessments
+                WHERE worker_id = ?
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+                """,
+                (worker_id,),
+            ).fetchone()
+
+    recognized_skills = [
+        {
+            "skill_name": skill_name,
+            "evidence_level": evidence_level,
+            "source": "worker_profile",
+        }
+        for skill_name, evidence_level in worker_skills
+    ]
+
+    if completed_assessment is not None:
+        assessment_summary = {
+            "assessment_id": completed_assessment[0],
+            "status": "COMPLETED",
+            "total_score": completed_assessment[2],
+            "maximum_score": completed_assessment[3],
+            "percentage": completed_assessment[4],
+            "completion_date": completed_assessment[5],
+        }
+    elif latest_noncompleted is not None:
+        assessment_summary = {
+            "assessment_id": latest_noncompleted[0],
+            "status": latest_noncompleted[1],
+            "total_score": None,
+            "maximum_score": 24,
+            "percentage": None,
+            "completion_date": None,
+            "current_stage": latest_noncompleted[2],
+        }
+    else:
+        assessment_summary = {
+            "assessment_id": None,
+            "status": "NO_ASSESSMENT",
+            "total_score": None,
+            "maximum_score": 24,
+            "percentage": None,
+            "completion_date": None,
+        }
+
+    demonstrated_concepts = []
+    relevant_feedback = []
+    safety_findings = []
+    safety_summary = {
+        "safety_critical_misconception": False,
+        "concerns": [],
+    }
+
+    if completed_assessment is not None:
+        assessment_id = completed_assessment[0]
+        with db() as conn:
+            safety_row = conn.execute(
+                """
+                SELECT safety_flags_json
+                FROM assessments
+                WHERE id = ?
+                """,
+                (assessment_id,),
+            ).fetchone()
+            answer_rows = conn.execute(
+                """
+                SELECT aa.question_id, aa.score, aa.rubric_feedback_json,
+                       aa.safety_flag, aa.safety_reason,
+                       aa.safety_concerns_json, q.skill_tag
+                FROM assessment_answers AS aa
+                JOIN assessment_questions AS aq
+                  ON aq.assessment_id = aa.assessment_id
+                 AND aq.question_id = aa.question_id
+                JOIN questions AS q
+                  ON q.question_id = aa.question_id
+                WHERE aa.assessment_id = ?
+                ORDER BY aq.question_order
+                """,
+                (assessment_id,),
+            ).fetchall()
+
+        if safety_row is not None:
+            parsed_safety = parse_passport_json(
+                safety_row[0],
+                "safety_flags_json",
+            )
+            if isinstance(parsed_safety, dict):
+                safety_summary = {
+                    "safety_critical_misconception": bool(
+                        parsed_safety.get(
+                            "safety_critical_misconception",
+                            False,
+                        )
+                    ),
+                    "concerns": parsed_safety.get("concerns", [])
+                    if isinstance(parsed_safety.get("concerns", []), list)
+                    else [],
+                }
+
+        assessed_skills = {}
+        for (
+            question_id,
+            answer_score,
+            feedback_json,
+            safety_flag,
+            safety_reason,
+            concerns_json,
+            skill_tag,
+        ) in answer_rows:
+            feedback = parse_passport_json(
+                feedback_json,
+                "rubric_feedback_json",
+            )
+            if isinstance(feedback, dict):
+                if isinstance(feedback.get("feedback"), str) and feedback["feedback"].strip():
+                    relevant_feedback.append(
+                        {
+                            "question_id": question_id,
+                            "skill_tag": skill_tag,
+                            "feedback": feedback["feedback"],
+                            "score": answer_score,
+                        }
+                    )
+                concept_evaluations = feedback.get("concept_evaluations", [])
+                if isinstance(concept_evaluations, list):
+                    for concept in concept_evaluations:
+                        if not isinstance(concept, dict) or not concept.get("demonstrated"):
+                            continue
+                        evidence = concept.get("evidence")
+                        rationale = concept.get("rationale")
+                        demonstrated_concepts.append(
+                            {
+                                "question_id": question_id,
+                                "skill_tag": skill_tag,
+                                "concept": concept.get("concept"),
+                                "evidence": evidence,
+                                "rationale": rationale,
+                            }
+                        )
+                        if skill_tag:
+                            assessed_skills[skill_tag] = True
+
+            if safety_flag == 1:
+                concerns = parse_passport_json(
+                    concerns_json,
+                    "safety_concerns_json",
+                )
+                if isinstance(concerns, list):
+                    for concern in concerns:
+                        if not isinstance(concern, dict):
+                            continue
+                        safety_findings.append(
+                            {
+                                "question_id": question_id,
+                                "concern": concern.get("concern"),
+                                "evidence": concern.get("evidence"),
+                                "reason": safety_reason,
+                            }
+                        )
+
+        for skill_tag in assessed_skills:
+            recognized_skills.append(
+                {
+                    "skill_name": skill_tag,
+                    "evidence_level": "ASSESSED",
+                    "source": "structured_knowledge_assessment",
+                    "assessment_id": assessment_id,
+                }
+            )
+
+        if safety_findings:
+            safety_summary["concerns"] = safety_findings
+        if any(
+            finding.get("concern") or finding.get("evidence")
+            for finding in safety_findings
+        ):
+            safety_summary["safety_critical_misconception"] = True
+
+    return {
+        "worker_profile": {
+            "worker_id": worker[0],
+            "name": worker[1],
+            "trade": worker[4],
+            "language": worker[2],
+            "location": worker[3],
+            "experience": {
+                "years": worker[5],
+                "evidence_level": worker[6],
+            },
+        },
+        "recognized_skills": recognized_skills,
+        "assessment_summary": assessment_summary,
+        "assessment_evidence": {
+            "demonstrated_concepts": demonstrated_concepts,
+            "relevant_feedback": relevant_feedback,
+            "safety": safety_summary,
+        },
+        "evidence_classification": {
+            "SELF_REPORTED": "Skill described by the worker.",
+            "ASSESSED": "Skill supported by the structured knowledge assessment.",
+            "INDEPENDENTLY_VERIFIED": (
+                "Skill confirmed by an authorized human assessor."
+            ),
+        },
+    }
+
+
 def get_assessment_lifecycle() -> AssessmentLifecycle:
     """Construct the lifecycle with the existing repository and Gemini evaluator."""
     repository = AssessmentRepository(db)
