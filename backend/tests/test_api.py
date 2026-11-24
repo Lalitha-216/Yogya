@@ -4,8 +4,11 @@ import json
 import sqlite3
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from google.genai import errors as genai_errors
+from google.genai import errors as genai_errors
 
 import main
 from assessment.rubric_evaluator import (
@@ -138,11 +141,125 @@ def test_get_worker_returns_saved_profile(client, monkeypatch):
         "id": wid, "name": "Ramesh", "language": "te", "location": "Kakinada",
         "raw_transcript": BODY["transcript"], "trade": "Electrician",
         "experience_years": 5, "evidence_level": "SELF_REPORTED",
+        "extraction_source": "gemini",
         "skills": [
             {"skill_name": "Fan installation", "evidence_level": "SELF_REPORTED"},
             {"skill_name": "Wiring repair", "evidence_level": "SELF_REPORTED"},
         ],
     }
+
+
+def test_gemini_503_falls_back_and_persists_profile(client, monkeypatch, tmp_path):
+    transcript = "  I repair wiring and install ceiling fans. I have worked for five years.  "
+    use_gemini(
+        monkeypatch,
+        genai_errors.APIError(503, {"error": {"message": "model experiencing high demand"}}),
+    )
+
+    response = client.post(
+        "/api/profile/discover",
+        json={**BODY, "language": "en", "transcript": transcript},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    worker_id = data["worker_id"]
+    assert type(worker_id) is int and worker_id > 0
+    assert data["profile"]["skills"] == ["Fan installation", "Wiring repair"]
+    assert data["profile"]["experience_years"] == 5
+    assert data["profile"]["evidence_level"] == "SELF_REPORTED"
+    assert data["profile"]["extraction_source"] == "rule_based_fallback"
+    assert data["detected_trade"] is None
+    assert data["trade_mismatch"] is None
+
+    worker = client.get(f"/api/workers/{worker_id}")
+    assert worker.status_code == 200
+    assert worker.json()["raw_transcript"] == transcript
+    assert worker.json()["extraction_source"] == "rule_based_fallback"
+    assert all(
+        skill["evidence_level"] == "SELF_REPORTED"
+        for skill in worker.json()["skills"]
+    )
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        assert conn.execute(
+            "SELECT experience_years, experience_known, extraction_source FROM workers"
+        ).fetchone() == (5, 1, "rule_based_fallback")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        genai_errors.APIError(429, {"error": {"message": "rate limited"}}),
+        httpx.ReadTimeout("request timed out"),
+        httpx.ConnectError("temporarily unavailable"),
+    ],
+)
+def test_other_transient_gemini_failures_use_fallback(client, monkeypatch, failure):
+    use_gemini(monkeypatch, failure)
+    transcript = "I repair wiring."
+
+    response = client.post(
+        "/api/profile/discover",
+        json={**BODY, "language": "en", "transcript": transcript},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["profile"]["extraction_source"] == "rule_based_fallback"
+    assert response.json()["profile"]["skills"] == ["Wiring repair"]
+
+
+def test_fallback_keeps_unknown_experience_unknown(client, monkeypatch, tmp_path):
+    use_gemini(
+        monkeypatch,
+        genai_errors.APIError(503, {"error": {"message": "temporarily unavailable"}}),
+    )
+
+    response = client.post(
+        "/api/profile/discover",
+        json={**BODY, "transcript": "I repair wiring."},
+    )
+
+    assert response.status_code == 200
+    worker_id = response.json()["worker_id"]
+    assert response.json()["profile"]["experience_years"] is None
+    worker = client.get(f"/api/workers/{worker_id}")
+    assert worker.json()["experience_years"] is None
+    passport = client.get(f"/api/workers/{worker_id}/passport").json()
+    assert passport["worker_profile"]["experience"]["years"] is None
+    assert passport["worker_profile"]["extraction_source"] == "rule_based_fallback"
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        assert conn.execute(
+            "SELECT experience_years, experience_known FROM workers"
+        ).fetchone() == (0, 0)
+
+
+def test_fallback_without_supported_skills_still_creates_profile(client, monkeypatch):
+    use_gemini(
+        monkeypatch,
+        genai_errors.APIError(503, {"error": {"message": "temporarily unavailable"}}),
+    )
+
+    response = client.post(
+        "/api/profile/discover",
+        json={**BODY, "transcript": "I am an electrician."},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["profile"]["skills"] == []
+    assert response.json()["profile"]["experience_years"] is None
+    assert response.json()["profile"]["extraction_source"] == "rule_based_fallback"
+    assert client.get(f"/api/workers/{response.json()['worker_id']}").status_code == 200
+
+
+def test_rule_based_extraction_supports_telugu_and_ignores_negative_claims():
+    assert main.extract_rule_based_profile(
+        "ఫ్యాన్ అమర్చడం, వైరింగ్ మరమ్మత్తు. ఐదు సంవత్సరాలు పని.",
+        "Electrician",
+    ) == (5, ["Fan installation", "Wiring repair"])
+    assert main.extract_rule_based_profile(
+        "I don't repair wiring.",
+        "Electrician",
+    ) == (None, [])
 
 
 def test_get_unknown_worker_404(client):
@@ -396,6 +513,118 @@ def test_submit_answer_returns_score_feedback_and_safety(
     assert data["feedback"] == "Answer-specific feedback."
     assert data["safety_critical_misconception"] is False
     assert data["safety_concerns"] == []
+
+
+def test_submit_answer_succeeds_when_gemini_is_unavailable(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    class UnavailableGemini:
+        def __init__(self):
+            self.calls = 0
+
+        def generate_content(self, **kwargs):
+            self.calls += 1
+            raise genai_errors.APIError(
+                503,
+                {"error": {"message": "model experiencing high demand"}},
+            )
+
+    unavailable_gemini = UnavailableGemini()
+    monkeypatch.setattr(main, "_client", SimpleNamespace(models=unavailable_gemini))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+
+    response = client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json={
+            "question_id": "E01",
+            "answer_text": (
+                "I would use a screwdriver with a suitable tip because it fits "
+                "the screw and helps prevent damage."
+            ),
+            "answer_source": "TEXT",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["score"] == 4
+    assert all(
+        item["demonstrated"]
+        for item in response.json()["concept_evaluations"]
+    )
+    assert unavailable_gemini.calls == 0
+    progress = client.get(
+        f"/api/assessments/{assessment['assessment_id']}"
+    ).json()
+    assert progress["answered_question_count"] == 1
+    assert progress["current_stage"] == 1
+
+
+def test_answer_retry_persists_once_and_advances_only_after_both_answers(
+    client,
+    tmp_path,
+):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    assessment_id = assessment["assessment_id"]
+    first_answer = {
+        "question_id": "E01",
+        "answer_text": (
+            "I would use a screwdriver with a suitable tip because it fits the "
+            "screw and helps prevent damage."
+        ),
+        "answer_source": "TEXT",
+    }
+
+    first = client.post(
+        f"/api/assessments/{assessment_id}/answers",
+        json=first_answer,
+    )
+    retry = client.post(
+        f"/api/assessments/{assessment_id}/answers",
+        json=first_answer,
+    )
+    assert first.status_code == 200
+    assert first.json()["score"] == 4
+    assert retry.status_code == 409
+    progress_after_retry = client.get(
+        f"/api/assessments/{assessment_id}"
+    ).json()
+    assert progress_after_retry["answered_question_count"] == 1
+    assert progress_after_retry["current_stage"] == 1
+
+    second = client.post(
+        f"/api/assessments/{assessment_id}/answers",
+        json={
+            "question_id": "E02",
+            "answer_text": (
+                "A switch controls the electrical supply to a load, and a socket "
+                "provides a connection for an appliance because it lets the "
+                "appliance receive power."
+            ),
+            "answer_source": "TEXT",
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["score"] == 4
+    advanced = client.post(
+        f"/api/assessments/{assessment_id}/stages/next"
+    )
+    assert advanced.status_code == 200
+    assert advanced.json()["stage_number"] == 2
+    assert advanced.json()["stage2_difficulty"] == "INTERMEDIATE"
+    assert client.get(
+        f"/api/assessments/{assessment_id}"
+    ).json()["answered_question_count"] == 2
 
 
 @pytest.mark.parametrize(

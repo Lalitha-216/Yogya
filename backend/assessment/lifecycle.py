@@ -75,7 +75,7 @@ class CurrentQuestion:
 
 @dataclass(frozen=True)
 class SubmittedAnswer:
-    """Persisted answer and Gemini evaluation result."""
+    """Persisted answer and deterministic rubric evaluation result."""
 
     answer: AnswerRecord
     evaluation: EvaluationResult

@@ -6,6 +6,7 @@ import { ASSESSMENT_COPY } from "./assessment/copy";
 import DemoProfilePanel from "./dev/DemoProfilePanel";
 import { buildDemoProfile, DEMO_COPY } from "./dev/demoProfile";
 import SkillPassportPage from "./passport/SkillPassportPage";
+import JobRecommendationsPage from "./jobs/JobRecommendationsPage";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -110,12 +111,15 @@ const COPY = {
     profileCreated: "PROFILE CREATED",
     experienceTakingShape: "Your experience is taking shape.",
     profileSaved: "Your profile has been saved. Review the extracted information below.",
+    ruleBasedFallback: "Rule-based fallback used because Gemini was temporarily unavailable.",
+    fallbackNoSkills: "Your profile was saved, but no specific skills could be identified from this transcript. Add more detail to your work description to help identify skills.",
     yogyaProfile: "YOGYA SKILL PROFILE",
     locationNotProvided: "Location not provided",
     selfReported: "SELF-REPORTED",
     trade: "Trade",
     experience: "Experience",
     years: "years",
+    experienceUnknown: "Not specified",
     workerId: "Worker ID",
     tradeMismatch: "Your description sounds more like {trade} work. Your selected trade was saved.",
     skillsIdentified: "Skills identified",
@@ -227,12 +231,15 @@ const COPY = {
     profileCreated: "ప్రొఫైల్ రూపొందించబడింది",
     experienceTakingShape: "మీ అనుభవంతో ప్రొఫైల్ సిద్ధమవుతోంది.",
     profileSaved: "మీ ప్రొఫైల్ భద్రపరచబడింది. దిగువ వివరాలను పరిశీలించండి.",
+    ruleBasedFallback: "Gemini తాత్కాలికంగా అందుబాటులో లేకపోవడంతో నియమాల ఆధారిత పద్ధతిని ఉపయోగించాం.",
+    fallbackNoSkills: "మీ ప్రొఫైల్ భద్రపరచబడింది. ఈ వివరణలోంచి నిర్దిష్ట నైపుణ్యాలను గుర్తించలేకపోయాం. నైపుణ్యాలను గుర్తించేందుకు మీ పని గురించి మరింత వివరించండి.",
     yogyaProfile: "యోగ్య నైపుణ్య ప్రొఫైల్",
     locationNotProvided: "ప్రాంతం ఇవ్వలేదు",
     selfReported: "స్వయంగా తెలిపినవి",
     trade: "వృత్తి",
     experience: "అనుభవం",
     years: "సంవత్సరాలు",
+    experienceUnknown: "పేర్కొనలేదు",
     workerId: "కార్మికుడి ఐడీ",
     tradeMismatch: "మీ వివరణ {trade} పనికి దగ్గరగా ఉంది. మీరు ఎంచుకున్న వృత్తినే భద్రపరిచాం.",
     skillsIdentified: "గుర్తించిన నైపుణ్యాలు",
@@ -346,12 +353,15 @@ const COPY = {
     profileCreated: "प्रोफ़ाइल बन गई",
     experienceTakingShape: "आपके अनुभव की प्रोफ़ाइल तैयार है।",
     profileSaved: "आपकी प्रोफ़ाइल सहेज ली गई है। नीचे निकाली गई जानकारी देखें।",
+    ruleBasedFallback: "Gemini के अस्थायी रूप से उपलब्ध न होने पर नियम-आधारित तरीका इस्तेमाल किया गया।",
+    fallbackNoSkills: "आपकी प्रोफ़ाइल सहेज ली गई है, लेकिन इस विवरण से कोई खास कौशल नहीं पहचाना जा सका। कौशल पहचानने में मदद के लिए अपने काम के बारे में कुछ और बताएँ।",
     yogyaProfile: "योग्या कौशल प्रोफ़ाइल",
     locationNotProvided: "स्थान नहीं दिया गया",
     selfReported: "स्वयं बताई गई जानकारी",
     trade: "काम",
     experience: "अनुभव",
     years: "वर्ष",
+    experienceUnknown: "नहीं बताया गया",
     workerId: "कामगार आईडी",
     tradeMismatch: "आपका विवरण {trade} के काम से ज़्यादा मेल खाता है। आपके चुने हुए काम को ही सहेजा गया है।",
     skillsIdentified: "पहचाने गए कौशल",
@@ -610,7 +620,7 @@ export default function App() {
           language: apiLanguage(language),
           location,
           selected_trade: selectedTrade,
-          transcript: transcript.trim(),
+          transcript,
         }),
       });
 
@@ -1044,7 +1054,18 @@ export default function App() {
             <div className="result-success-icon">✓</div>
             <span className="section-kicker">{text.profileCreated}</span>
             <h1>{text.experienceTakingShape}</h1>
-            <p className="result-intro">{text.profileSaved}</p>
+            <p className="result-intro">
+              {savedResult.profile.extraction_source === "rule_based_fallback" &&
+              !savedResult.profile.skills?.length
+                ? text.fallbackNoSkills
+                : text.profileSaved}
+            </p>
+
+            {savedResult.profile.extraction_source === "rule_based_fallback" && (
+              <div className="status-message warning-message" role="note">
+                {text.ruleBasedFallback}
+              </div>
+            )}
 
             {import.meta.env.DEV && savedResult.demo && (
               <div className="status-message warning-message dev-demo-banner" role="note">
@@ -1069,7 +1090,11 @@ export default function App() {
                 </div>
                 <div>
                   <small>{text.experience}</small>
-                  <strong>{savedResult.profile.experience_years} {text.years}</strong>
+                  <strong>
+                    {typeof savedResult.profile.experience_years === "number"
+                      ? `${savedResult.profile.experience_years} ${text.years}`
+                      : text.experienceUnknown}
+                  </strong>
                 </div>
                 <div>
                   <small>{text.workerId}</small>
@@ -1136,6 +1161,16 @@ export default function App() {
             language={language}
             workerId={savedResult.worker_id}
             onBack={() => setStep("result")}
+            onOpenJobs={() => setStep("jobs")}
+          />
+        )}
+
+        {step === "jobs" && savedResult && (
+          <JobRecommendationsPage
+            apiBase={API_BASE}
+            language={language}
+            workerId={savedResult.worker_id}
+            onBack={() => setStep("passport")}
           />
         )}
       </main>

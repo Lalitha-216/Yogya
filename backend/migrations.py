@@ -389,10 +389,38 @@ def _create_verification_records_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_profile_discovery_metadata(connection: sqlite3.Connection) -> None:
+    """Persist explicit unknown-experience state and profile extraction provenance."""
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(workers)").fetchall()
+    }
+    if "experience_known" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE workers
+            ADD COLUMN experience_known INTEGER NOT NULL DEFAULT 1
+                CHECK (
+                    typeof(experience_known) = 'integer'
+                    AND experience_known IN (0, 1)
+                )
+            """
+        )
+    if "extraction_source" not in columns:
+        connection.execute(
+            """
+            ALTER TABLE workers
+            ADD COLUMN extraction_source TEXT NOT NULL DEFAULT 'gemini'
+                CHECK (extraction_source IN ('gemini', 'rule_based_fallback'))
+            """
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_assessment_schema", _create_assessment_schema),
     Migration(2, "seed_assessment_question_bank", _seed_question_bank),
     Migration(3, "create_verification_records", _create_verification_records_schema),
+    Migration(4, "add_profile_discovery_metadata", _add_profile_discovery_metadata),
 )
 
 

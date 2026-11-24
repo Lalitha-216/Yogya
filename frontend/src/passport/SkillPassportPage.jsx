@@ -18,6 +18,8 @@ const COPY = {
     trade: "Trade",
     language: "Language",
     experience: "Experience",
+    experienceUnknown: "Not specified",
+    ruleBasedFallback: "This profile was extracted using rules because Gemini was temporarily unavailable.",
     years: "years",
     skills: "Recognized skills",
     noSkills: "No skills are recorded for this worker yet.",
@@ -56,6 +58,7 @@ const COPY = {
     reason: "Reason",
     notProvided: "Not provided",
     demoWarning: "Independent verification is demo-only here. The assessor's identity has not been authenticated.",
+    jobs: "Find matching jobs",
     languageNames: { en: "English", te: "Telugu", hi: "Hindi" },
     trades: { Electrician: "Electrician", Plumber: "Plumber" },
   },
@@ -75,6 +78,8 @@ const COPY = {
     trade: "వృత్తి",
     language: "భాష",
     experience: "అనుభవం",
+    experienceUnknown: "పేర్కొనలేదు",
+    ruleBasedFallback: "Gemini తాత్కాలికంగా అందుబాటులో లేకపోవడంతో ఈ ప్రొఫైల్‌ను నియమాల ఆధారంగా రూపొందించాం.",
     years: "సంవత్సరాలు",
     evidence: "ఆధారం",
     skills: "గుర్తించిన నైపుణ్యాలు",
@@ -113,6 +118,7 @@ const COPY = {
     reason: "వివరణ",
     notProvided: "ఇవ్వలేదు",
     demoWarning: "ఇక్కడి స్వతంత్ర ధృవీకరణ డెమో మాత్రమే. ధృవీకరించిన వ్యక్తి గుర్తింపును నిర్ధారించలేదు.",
+    jobs: "సరిపోయే ఉద్యోగాలను చూడండి",
     languageNames: { en: "ఇంగ్లీష్", te: "తెలుగు", hi: "హిందీ" },
     trades: { Electrician: "ఎలక్ట్రీషియన్", Plumber: "ప్లంబర్", Other: "ఇతర" },
   },
@@ -132,6 +138,8 @@ const COPY = {
     trade: "काम",
     language: "भाषा",
     experience: "अनुभव",
+    experienceUnknown: "नहीं बताया गया",
+    ruleBasedFallback: "Gemini अस्थायी रूप से उपलब्ध न होने पर यह प्रोफ़ाइल नियम-आधारित तरीके से बनाई गई।",
     years: "वर्ष",
     evidence: "साक्ष्य",
     skills: "पहचाने गए कौशल",
@@ -170,6 +178,7 @@ const COPY = {
     reason: "कारण",
     notProvided: "नहीं दिया गया",
     demoWarning: "यहाँ स्वतंत्र सत्यापन केवल डेमो है। सत्यापनकर्ता की पहचान प्रमाणित नहीं की गई है।",
+    jobs: "मिलते-जुलते काम देखें",
     languageNames: { en: "अंग्रेज़ी", te: "तेलुगु", hi: "हिन्दी" },
     trades: { Electrician: "इलेक्ट्रीशियन", Plumber: "प्लंबर", Other: "अन्य" },
   },
@@ -227,7 +236,13 @@ function EvidenceItem({ item, t }) {
   );
 }
 
-export default function SkillPassportPage({ apiBase, language, workerId, onBack }) {
+export default function SkillPassportPage({
+  apiBase,
+  language,
+  workerId,
+  onBack,
+  onOpenJobs,
+}) {
   const t = COPY[language] || COPY.en;
   const [attempt, setAttempt] = useState(0);
   const [request, setRequest] = useState(null);
@@ -402,7 +417,7 @@ export default function SkillPassportPage({ apiBase, language, workerId, onBack 
               <DisplayField label={t.experience}>
                 {typeof profile.experience?.years === "number"
                   ? `${profile.experience.years} ${t.years}`
-                  : t.notProvided}
+                  : t.experienceUnknown}
               </DisplayField>
               {profile.experience?.evidence_level && (
                 <DisplayField label={t.evidence}>
@@ -410,6 +425,11 @@ export default function SkillPassportPage({ apiBase, language, workerId, onBack 
                 </DisplayField>
               )}
             </div>
+            {profile.extraction_source === "rule_based_fallback" && (
+              <div className="status-message warning-message passport-demo-warning" role="note">
+                {t.ruleBasedFallback}
+              </div>
+            )}
           </section>
 
           <section className="passport-card">
@@ -582,6 +602,11 @@ export default function SkillPassportPage({ apiBase, language, workerId, onBack 
         <button type="button" className="as-button-secondary" onClick={onBack}>
           ← {t.back}
         </button>
+        {Number.isInteger(workerId) && workerId > 0 && (
+          <button type="button" className="primary-button" onClick={onOpenJobs}>
+            {t.jobs} <span>→</span>
+          </button>
+        )}
       </div>
     </section>
   );

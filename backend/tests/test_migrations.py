@@ -401,11 +401,14 @@ def test_init_db_preserves_legacy_tables_and_records_created_before_initializati
             """
         )
         connection.commit()
-        workers_before = connection.execute("SELECT * FROM workers").fetchall()
+        workers_before = connection.execute(
+            """
+            SELECT id, name, language, location, raw_transcript, trade,
+                   experience_years, evidence_level
+            FROM workers
+            """
+        ).fetchall()
         skills_before = connection.execute("SELECT * FROM worker_skills").fetchall()
-        workers_schema_before = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'workers'"
-        ).fetchone()
         skills_schema_before = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worker_skills'"
         ).fetchone()
@@ -415,11 +418,20 @@ def test_init_db_preserves_legacy_tables_and_records_created_before_initializati
     main.init_db()
 
     with main.db() as connection:
-        assert connection.execute("SELECT * FROM workers").fetchall() == workers_before
+        assert connection.execute(
+            """
+            SELECT id, name, language, location, raw_transcript, trade,
+                   experience_years, evidence_level
+            FROM workers
+            """
+        ).fetchall() == workers_before
         assert connection.execute("SELECT * FROM worker_skills").fetchall() == skills_before
         assert connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'workers'"
-        ).fetchone() == workers_schema_before
+            "SELECT experience_known, extraction_source FROM workers WHERE id = 17"
+        ).fetchone() == (1, "gemini")
+        assert connection.execute(
+            "SELECT name FROM pragma_table_info('workers')"
+        ).fetchall()[-2:] == [("experience_known",), ("extraction_source",)]
         assert connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'worker_skills'"
         ).fetchone() == skills_schema_before
@@ -659,6 +671,9 @@ def test_verification_records_migration_creates_table_constraints_and_indexes(
             3,
             "create_verification_records",
         )
+        assert connection.execute(
+            "SELECT version, name FROM schema_migrations WHERE version = 4"
+        ).fetchone() == (4, "add_profile_discovery_metadata")
     finally:
         connection.close()
 
@@ -678,7 +693,7 @@ def test_question_seed_migration_inserts_24_questions_with_expected_trade_counts
         assert sum(trade == Trade.PLUMBER.value for _, trade in rows) == 12
         assert {version for version, in connection.execute(
             "SELECT version FROM schema_migrations"
-        )} == {1, 2, 3}
+        )} == {1, 2, 3, 4}
     finally:
         connection.close()
 
@@ -809,7 +824,7 @@ def test_matching_existing_question_content_is_skipped(tmp_path, monkeypatch):
         ).fetchone() == row
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
     finally:
         connection.close()
 
@@ -850,7 +865,7 @@ def test_conflicting_question_content_raises_and_rolls_back_seed_transaction(
         ]
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (3,)]
+        ).fetchall() == [(1,), (3,), (4,)]
     finally:
         connection.close()
 
@@ -879,7 +894,7 @@ def test_invalid_question_data_is_rejected_without_partial_seed(
         assert connection.execute("SELECT COUNT(*) FROM questions").fetchone() == (0,)
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (3,)]
+        ).fetchall() == [(1,), (3,), (4,)]
     finally:
         connection.close()
 
