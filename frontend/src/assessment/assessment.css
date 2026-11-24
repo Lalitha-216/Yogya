@@ -1,0 +1,481 @@
+/* Assessment module. Reuses the colour tokens and base classes from App.css
+   (--purple, .primary-button, .trade-option, .onboarding-card, .result-card, ...).
+   Everything new is prefixed "as-" to avoid collisions. */
+
+.as-lang-row {
+  max-width: 850px;
+  margin: 0 auto;
+  padding: 18px 25px 0;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.as-actions {
+  margin-top: 24px;
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.as-nav {
+  flex-wrap: nowrap;
+  justify-content: space-between;
+}
+
+.as-button-secondary {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 13px 19px;
+  background: var(--white);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+
+.as-button-secondary:hover {
+  border-color: var(--purple);
+  color: var(--purple);
+}
+
+.as-button-secondary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  border-color: var(--border);
+  color: var(--ink);
+}
+
+/* Progress */
+
+.as-progress {
+  margin-bottom: 20px;
+}
+
+.as-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.as-progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 20px;
+  background: #ebe9f3;
+}
+
+.as-progress-fill {
+  height: 100%;
+  border-radius: 20px;
+  background: var(--purple);
+  transition: width 0.3s ease;
+}
+
+/* Question card */
+
+.as-question {
+  margin: 10px 0 20px;
+  font-size: 19px;
+  line-height: 1.5;
+  letter-spacing: -0.2px;
+}
+
+.as-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.as-option .trade-info strong {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.as-option:hover {
+  border-color: var(--purple);
+}
+
+/* Answer mode switch + text answer */
+
+.as-mode {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.as-mode-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.as-mode .language-switch button {
+  white-space: nowrap;
+}
+
+.as-text textarea {
+  min-height: 140px;
+  resize: vertical;
+  line-height: 1.7;
+}
+
+.as-count {
+  text-align: right;
+}
+
+.as-note {
+  max-width: 520px;
+  margin: 22px auto 0;
+  justify-content: center;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .as-progress-fill {
+    transition: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .as-lang-row {
+    padding: 14px 15px 0;
+  }
+
+  .as-question {
+    font-size: 17px;
+  }
+
+  .as-mode .language-switch {
+    width: 100%;
+  }
+
+  .as-mode .language-switch button {
+    flex: 1;
+    padding: 9px 8px;
+  }
+
+  .as-nav .primary-button,
+  .as-nav .as-button-secondary {
+    flex: 1;
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .as-actions:not(.as-nav) .primary-button,
+  .as-actions:not(.as-nav) .as-button-secondary {
+    flex: 1 1 100%;
+  }
+}
+
+
+/* Voice answer mode */
+.as-voice {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--white);
+}
+
+.as-voice-actions {
+  display: flex;
+  justify-content: center;
+}
+
+.as-recording-status {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: #b42318;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.as-recording-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #dc2626;
+  animation: as-recording-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes as-recording-pulse {
+  50% { opacity: 0.35; }
+}
+
+.as-audio-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.as-audio-preview p {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.as-audio-preview audio {
+  width: 100%;
+  max-width: 100%;
+}
+
+.as-voice-error {
+  margin: 0;
+  color: #b42318;
+  font-size: 13px;
+}
+
+.as-mode .language-switch button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .as-recording-dot { animation: none; }
+}
+
+
+/* Phase 2C: answer review */
+.as-review-section {
+  width: 100%;
+}
+
+.as-review-list {
+  display: grid;
+  gap: 14px;
+  margin: 24px 0;
+  text-align: left;
+}
+
+.as-review-item {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  background: var(--white);
+}
+
+.as-review-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.as-review-number {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #ebe9f3;
+  color: var(--purple);
+  font-weight: 800;
+  font-size: 12px;
+}
+
+.as-review-mode {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.as-review-item h3 {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.as-review-answer {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.as-review-edit {
+  border: 0;
+  padding: 4px 0;
+  background: transparent;
+  color: var(--purple);
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.as-review-privacy {
+  text-align: center;
+}
+
+.as-review-actions {
+  justify-content: space-between;
+}
+
+@media (max-width: 600px) {
+  .as-review-actions .primary-button,
+  .as-review-actions .as-button-secondary {
+    flex: 1 1 100%;
+  }
+}
+
+/* Skill Passport preview */
+.as-passport-section {
+  width: 100%;
+}
+
+.as-passport {
+  width: 100%;
+  padding: 26px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--white);
+  box-shadow: 0 12px 32px #17152b0a;
+  text-align: left;
+}
+
+.as-passport-header {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 20px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.as-passport-header > div,
+.as-passport-meta > div {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.as-passport-label,
+.as-passport-meta span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.as-passport-header strong {
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.as-passport-header .as-passport-complete {
+  align-self: flex-start;
+  padding: 6px 10px;
+  border-radius: 20px;
+  background: #eaf7ef;
+  color: #267343;
+  font-size: 12px;
+}
+
+.as-passport-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 18px;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.as-passport-meta strong {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.as-passport-section-block {
+  margin-top: 23px;
+}
+
+.as-passport-section-block h2 {
+  margin: 0 0 12px;
+  color: var(--ink);
+  font-size: 15px;
+}
+
+.as-passport-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 10px;
+}
+
+.as-passport-mode {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #faf9fc;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.as-passport-mode strong {
+  color: var(--ink);
+  font-size: 16px;
+}
+
+.as-passport-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+}
+
+.as-passport-evidence {
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--white);
+}
+
+.as-passport-evidence h3 {
+  margin: 0 0 10px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.as-passport-evidence-status {
+  display: inline-block;
+  color: var(--purple);
+  font-size: 12px;
+}
+
+.as-passport-evidence p {
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.as-passport-disclaimer {
+  margin: 22px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+@media (max-width: 600px) {
+  .as-passport {
+    padding: 18px 15px;
+  }
+}

@@ -1,0 +1,71 @@
+/* DEVELOPMENT ONLY: demo profile panel and banner. */
+
+.dev-demo {
+  margin-top: 18px;
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  border: 1px dashed #d9a441;
+  border-radius: 12px;
+  background: #fffaf0;
+}
+
+.dev-demo-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.dev-demo-tag {
+  display: inline-block;
+  padding: 3px 9px;
+  border-radius: 20px;
+  background: #985a0b;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.dev-demo-body p {
+  margin: 8px 0 0;
+  color: #7a5a1e;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.dev-demo-button {
+  flex-shrink: 0;
+  padding: 11px 16px;
+  border: 1px solid #d9a441;
+  border-radius: 9px;
+  background: #fff;
+  color: #985a0b;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.dev-demo-button:hover {
+  background: #fff1d6;
+}
+
+.dev-demo-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.dev-demo-banner {
+  max-width: 640px;
+  margin: 18px auto 0;
+  justify-content: center;
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  .dev-demo {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
