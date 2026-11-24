@@ -904,3 +904,295 @@ def test_passport_does_not_expose_raw_worker_transcript(client, tmp_path):
     assert response.status_code == 200
     payload = response.json()
     assert "raw_transcript" not in str(payload)
+
+
+def test_worker_jobs_electrician_success(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            UPDATE worker_skills
+            SET skill_name = 'Electrical safety'
+            WHERE worker_id = ?
+            """,
+            (worker_id,),
+        )
+
+    response = client.get(f"/api/workers/{worker_id}/jobs")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["worker_id"] == worker_id
+    assert data["trade"] == "Electrician"
+    assert data["demo"] is True
+    assert data["jobs"]
+    assert all(job["job_id"].startswith("DEMO-E-") for job in data["jobs"])
+
+
+def test_worker_jobs_plumber_success(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db", trade="Plumber")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            UPDATE worker_skills
+            SET skill_name = 'Pipe joint repair'
+            WHERE worker_id = ?
+            """,
+            (worker_id,),
+        )
+
+    response = client.get(f"/api/workers/{worker_id}/jobs")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["trade"] == "Plumber"
+    assert data["jobs"]
+    assert all(job["job_id"].startswith("DEMO-P-") for job in data["jobs"])
+
+
+def test_worker_jobs_location_filter(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+
+    response = client.get(
+        f"/api/workers/{worker_id}/jobs",
+        params={"location": "Hyderabad"},
+    )
+
+    assert response.status_code == 200
+    jobs = response.json()["jobs"]
+    assert jobs
+    assert all("hyderabad" in job["location"].lower() for job in jobs)
+
+
+def test_worker_jobs_unknown_worker(client):
+    response = client.get("/api/workers/9999/jobs")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Worker not found"
+
+
+def test_worker_jobs_trade_with_no_matching_listings_is_empty(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+
+    response = client.get(
+        f"/api/workers/{worker_id}/jobs",
+        params={"location": "No Such Demo Location"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["jobs"] == []
+
+
+def test_worker_jobs_preserve_evidence_and_preferred_skills(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            UPDATE worker_skills
+            SET skill_name = 'Electrical safety',
+                evidence_level = 'ASSESSED'
+            WHERE worker_id = ?
+            """,
+            (worker_id,),
+        )
+
+    response = client.get(f"/api/workers/{worker_id}/jobs")
+
+    assert response.status_code == 200
+    jobs = response.json()["jobs"]
+    assert jobs
+    matched = [
+        skill
+        for job in jobs
+        for skill in job["matched_skills"]
+    ]
+    assert matched
+    assert all(
+        skill["evidence_level"] in (
+            "SELF_REPORTED",
+            "ASSESSED",
+            "INDEPENDENTLY_VERIFIED",
+        )
+        for skill in matched
+    )
+    assert all(
+        skill["evidence_level"] != "INDEPENDENTLY_VERIFIED"
+        for skill in matched
+    )
+
+
+def insert_completed_assessment_for_job_evidence(
+    tmp_path,
+    worker_id,
+    *,
+    total_score,
+    demonstrated,
+):
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO assessments (
+                worker_id, trade, language, status, current_stage,
+                total_score, max_score, score_percentage, safety_flags_json,
+                started_at, completed_at
+            ) VALUES (?, 'Electrician', 'en', 'COMPLETED', 3,
+                      ?, 24, ?, '[]',
+                      '2026-01-01T00:00:00+00:00',
+                      '2026-01-02T00:00:00+00:00')
+            """,
+            (
+                worker_id,
+                total_score,
+                round(total_score * 100 / 24, 2),
+            ),
+        )
+        assessment_id = cursor.lastrowid
+        conn.execute(
+            """
+            INSERT INTO assessment_questions (
+                assessment_id, question_id, stage_number, question_order,
+                selection_reason, selected_at
+            ) VALUES (?, 'E03', 1, 1, 'Evidence test',
+                      '2026-01-01T00:00:00+00:00')
+            """,
+            (assessment_id,),
+        )
+        feedback = (
+            '{"feedback":"Test feedback","concept_evaluations":'
+            '[{"concept":"supply must be isolated","demonstrated":'
+            + ("true" if demonstrated else "false")
+            + ',"evidence":null,"rationale":"The answer does not demonstrate isolation"}]}'
+        )
+        conn.execute(
+            """
+            INSERT INTO assessment_answers (
+                assessment_id, question_id, stage_number, answer_text,
+                answer_source, score, rubric_feedback_json, safety_flag,
+                safety_reason, safety_concerns_json, answered_at
+            ) VALUES (?, 'E03', 1, 'Test answer', 'TEXT', ?, ?, 0,
+                      NULL, '[]', '2026-01-02T00:00:00+00:00')
+            """,
+            (assessment_id, 4 if demonstrated else 1, feedback),
+        )
+        conn.commit()
+    return assessment_id
+
+
+def test_job_matching_non_demonstrated_concept_not_assessed(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    insert_completed_assessment_for_job_evidence(
+        tmp_path,
+        worker_id,
+        total_score=6,
+        demonstrated=False,
+    )
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            UPDATE worker_skills
+            SET skill_name = 'Electrical safety',
+                evidence_level = 'SELF_REPORTED'
+            WHERE worker_id = ?
+            """,
+            (worker_id,),
+        )
+        conn.commit()
+
+    response = client.get(
+        f"/api/workers/{worker_id}/jobs",
+        params={"location": "Hyderabad"},
+    )
+
+    assert response.status_code == 200
+    electrical_safety_matches = [
+        skill
+        for job in response.json()["jobs"]
+        for skill in job["matched_skills"]
+        if skill["skill_name"].lower() == "electrical safety"
+    ]
+    assert electrical_safety_matches
+    assert all(
+        skill["evidence_level"] == "SELF_REPORTED"
+        for skill in electrical_safety_matches
+    )
+    assert all(
+        skill["evidence_level"] != "INDEPENDENTLY_VERIFIED"
+        for skill in electrical_safety_matches
+    )
+
+
+def test_job_matching_demonstrated_concept_is_assessed(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    insert_completed_assessment_for_job_evidence(
+        tmp_path,
+        worker_id,
+        total_score=18,
+        demonstrated=True,
+    )
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            "UPDATE worker_skills SET evidence_level = 'SELF_REPORTED' "
+            "WHERE worker_id = ?",
+            (worker_id,),
+        )
+        conn.commit()
+
+    response = client.get(
+        f"/api/workers/{worker_id}/jobs",
+        params={"location": "Hyderabad"},
+    )
+
+    assert response.status_code == 200
+    electrical_safety_matches = [
+        skill
+        for job in response.json()["jobs"]
+        for skill in job["matched_skills"]
+        if skill["skill_name"].lower() == "electrical safety"
+    ]
+    assert electrical_safety_matches
+    assert all(
+        skill["evidence_level"] == "ASSESSED"
+        for skill in electrical_safety_matches
+    )
+
+
+def test_high_assessment_score_does_not_assume_all_skills_demonstrated(
+    client,
+    tmp_path,
+):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    insert_completed_assessment_for_job_evidence(
+        tmp_path,
+        worker_id,
+        total_score=24,
+        demonstrated=False,
+    )
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            """
+            UPDATE worker_skills
+            SET skill_name = 'Electrical safety',
+                evidence_level = 'SELF_REPORTED'
+            WHERE worker_id = ?
+            """,
+            (worker_id,),
+        )
+        conn.commit()
+
+    response = client.get(f"/api/workers/{worker_id}/jobs")
+
+    assert response.status_code == 200
+    electrical_safety_matches = [
+        skill
+        for job in response.json()["jobs"]
+        for skill in job["matched_skills"]
+        if skill["skill_name"].lower() == "electrical safety"
+    ]
+    assert electrical_safety_matches
+    assert all(
+        skill["evidence_level"] == "SELF_REPORTED"
+        for skill in electrical_safety_matches
+    )
+    assert all(
+        skill["evidence_level"] != "INDEPENDENTLY_VERIFIED"
+        for skill in electrical_safety_matches
+    )

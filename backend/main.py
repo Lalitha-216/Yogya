@@ -38,6 +38,7 @@ from assessment.rubric_evaluator import (
     InputValidationError,
     evaluate_answer,
 )
+from jobs.matching import load_demo_jobs, match_jobs
 
 logger = logging.getLogger("yogya")
 
@@ -654,6 +655,147 @@ def get_worker_passport(worker_id: int) -> dict:
                 "Skill confirmed by an authorized human assessor."
             ),
         },
+    }
+
+
+@app.get("/api/workers/{worker_id}/jobs")
+def get_worker_jobs(worker_id: int, location: str | None = None) -> dict:
+    """Return deterministic demo-job matches for an existing worker."""
+    if type(worker_id) is not int or worker_id <= 0:
+        raise HTTPException(status_code=422, detail="Invalid worker_id.")
+
+    with db() as conn:
+        worker = conn.execute(
+            """
+            SELECT id, trade
+            FROM workers
+            WHERE id = ?
+            """,
+            (worker_id,),
+        ).fetchone()
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Worker not found")
+
+        worker_skill_rows = conn.execute(
+            """
+            SELECT skill_name, evidence_level
+            FROM worker_skills
+            WHERE worker_id = ?
+            ORDER BY id
+            """,
+            (worker_id,),
+        ).fetchall()
+
+        latest_assessment = conn.execute(
+            """
+            SELECT id
+            FROM assessments
+            WHERE worker_id = ? AND status = 'COMPLETED'
+            ORDER BY completed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (worker_id,),
+        ).fetchone()
+
+    worker_skills = [
+        {
+            "skill_name": skill_name,
+            "evidence_level": evidence_level,
+        }
+        for skill_name, evidence_level in worker_skill_rows
+    ]
+
+    if latest_assessment is not None:
+        assessment_id = latest_assessment[0]
+        with db() as conn:
+            assessed_rows = conn.execute(
+                """
+                SELECT aa.rubric_feedback_json, q.skill_tag
+                FROM assessment_answers AS aa
+                JOIN assessment_questions AS aq
+                  ON aq.assessment_id = aa.assessment_id
+                 AND aq.question_id = aa.question_id
+                JOIN questions AS q
+                  ON q.question_id = aa.question_id
+                WHERE aa.assessment_id = ?
+                ORDER BY aq.question_order
+                """,
+                (assessment_id,),
+            ).fetchall()
+        assessed_skills = set()
+        for feedback_json, skill_tag in assessed_rows:
+            if not skill_tag:
+                continue
+            feedback = parse_passport_json(
+                feedback_json,
+                "rubric_feedback_json",
+            )
+            if not isinstance(feedback, dict):
+                continue
+            concept_evaluations = feedback.get("concept_evaluations", [])
+            if not isinstance(concept_evaluations, list):
+                continue
+            if not any(
+                isinstance(concept, dict)
+                and concept.get("demonstrated") is True
+                for concept in concept_evaluations
+            ):
+                continue
+            assessed_skills.add(skill_tag)
+        for skill_tag in assessed_skills:
+            worker_skills.append(
+                {
+                    "skill_name": skill_tag,
+                    "evidence_level": "ASSESSED",
+                }
+            )
+
+    try:
+        jobs = load_demo_jobs()
+        matched_jobs = match_jobs(
+            worker[1],
+            worker_skills,
+            jobs,
+            location=location,
+        )
+    except ValueError as exc:
+        logger.error("Job matching configuration failure: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Job matching data could not be loaded.",
+        ) from exc
+
+    serialized_jobs = []
+    for match in matched_jobs:
+        listing = match.listing
+        serialized_jobs.append(
+            {
+                "job_id": listing.job_id,
+                "job_title": listing.job_title,
+                "employer_name": listing.employer_name,
+                "location": listing.location,
+                "description": listing.description,
+                "salary_min": listing.salary_min,
+                "salary_max": listing.salary_max,
+                "job_type": listing.job_type,
+                "match_percentage": match.match_percentage,
+                "matched_skills": [
+                    {
+                        "skill_name": skill.skill_name,
+                        "evidence_level": skill.evidence_level,
+                    }
+                    for skill in match.matched_skills
+                ],
+                "missing_skills": list(match.missing_skills),
+                "preferred_skills": list(listing.preferred_skills),
+            }
+        )
+
+    return {
+        "worker_id": worker[0],
+        "trade": worker[1],
+        "jobs": serialized_jobs,
+        "demo": True,
     }
 
 
