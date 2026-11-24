@@ -140,6 +140,11 @@
   text-align: center;
 }
 
+.as-request-status {
+  max-width: 850px;
+  margin: 12px auto;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .as-progress-fill {
     transition: none;

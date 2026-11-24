@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import "./assessment.css";
 import { ASSESSMENT_COPY, LANGUAGES } from "./copy";
-import { QUESTIONS } from "./questions";
 
 const fill = (template, values) =>
   Object.entries(values).reduce(
@@ -12,29 +11,93 @@ const fill = (template, values) =>
 const pickLanguage = (code) => (ASSESSMENT_COPY[code] ? code : "en");
 
 const MAX_TEXT = 500; // characters per typed answer
+const TOTAL_QUESTIONS = 6;
+
+function mergeQuestions(existing, incoming) {
+  const byId = new Map(existing.map((question) => [question.question_id, question]));
+  incoming.forEach((question) => {
+    if (question && typeof question.question_id === "string") {
+      byId.set(question.question_id, question);
+    }
+  });
+  return [...byId.values()].sort(
+    (left, right) => left.question_order - right.question_order
+  );
+}
+
+function validateQuestion(question, t) {
+  if (
+    !question ||
+    typeof question.question_id !== "string" ||
+    typeof question.question_text !== "string" ||
+    !Number.isInteger(question.question_order) ||
+    !Number.isInteger(question.stage_number)
+  ) {
+    throw new Error(t.invalidQuestion);
+  }
+  return question;
+}
+
+async function requestJson(url, options, t) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (error) {
+    if (error instanceof TypeError) throw new Error(t.backendUnavailable);
+    throw error;
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    const detail = typeof payload?.detail === "string"
+      ? payload.detail
+      : Array.isArray(payload?.detail)
+        ? JSON.stringify(payload.detail)
+        : "";
+    const error = new Error(
+      `${detail || t.requestFailed} (HTTP ${response.status})`
+    );
+    error.status = response.status;
+    throw error;
+  }
+  if (!payload || typeof payload !== "object") {
+    throw new Error(t.invalidResponse);
+  }
+  return payload;
+}
 
 /**
- * Assessment: intro -> questions -> final review -> local Skill Passport preview.
- * Answers live in local state only; nothing is sent to the backend and no score
- * is computed. `workerId` and `trade` come from the saved profile result.
+ * Assessment questions, evaluation, and results come from the backend.
+ * The browser keeps only current-session answer text and recordings for review.
  */
 export default function AssessmentFlow({
+  apiBase,
   workerId,
   workerName,
   workerLocation,
   trade,
   initialLanguage,
   onExit,
+  onOpenPassport,
 }) {
   const [lang, setLang] = useState(pickLanguage(initialLanguage));
-  const [phase, setPhase] = useState("intro"); // "intro" | "questions" | "review" | "done"
+  const [phase, setPhase] = useState("intro");
   const [index, setIndex] = useState(0);
-  // { [questionId]: { mode: "choice" | "text", optionId?: string, text?: string } }
-  // Both values are kept when the worker switches mode, so switching back restores
-  // them; the entry's active `mode` decides which one counts as the answer.
+  const [questions, setQuestions] = useState([]);
   const [answers, setAnswers] = useState({});
-  // Mode a not-yet-answered question opens in: follows the worker's last choice.
-  const [preferredMode, setPreferredMode] = useState("choice");
+  const [preferredMode, setPreferredMode] = useState("text");
+  const [assessmentId, setAssessmentId] = useState(null);
+  const [assessmentResult, setAssessmentResult] = useState(null);
+  const [completionSaved, setCompletionSaved] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState("");
+  const [apiError, setApiError] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [voiceError, setVoiceError] = useState("");
@@ -42,20 +105,17 @@ export default function AssessmentFlow({
   const streamRef = useRef(null);
   const objectUrlsRef = useRef(new Set());
 
-  // Follow the app's te/en switch; the assessment's own switch also offers Hindi.
-  useEffect(() => {
-    setLang(pickLanguage(initialLanguage));
-  }, [initialLanguage]);
-
   const t = ASSESSMENT_COPY[lang];
-  const questions = QUESTIONS[trade] || [];
-  const total = questions.length;
+  const total = TOTAL_QUESTIONS;
+  const hasValidWorkerId = Number.isInteger(workerId) && workerId > 0;
+  const question = questions[index];
   const isAnswered = (q) => {
-    const a = answers[q.id];
+    if (!q) return false;
+    const a = answers[q.question_id];
     if (!a) return false;
     if (a.mode === "text") return Boolean(a.text && a.text.trim());
-    if (a.mode === "voice") return Boolean(a.voiceUrl);
-    return Boolean(a.optionId);
+    if (a.mode === "voice") return Boolean(a.voiceBlob || a.voiceUrl || a.transcript);
+    return false;
   };
 
   useEffect(() => {
@@ -121,22 +181,250 @@ export default function AssessmentFlow({
   const stopVoiceRecording = () => {
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
   };
-  const answeredCount = questions.filter(isAnswered).length;
-  const answerModeCounts = questions.reduce((counts, question) => {
-    if (!isAnswered(question)) return counts;
-    const mode = answers[question.id]?.mode;
-    const key = mode === "voice" ? "voice" : mode === "text" ? "text" : "mcq";
-    counts[key] += 1;
+  const answeredCount = Object.values(answers).filter((answer) => answer.submitted).length;
+  const answerModeCounts = Object.values(answers).reduce((counts, answer) => {
+    if (answer.submitted && (answer.mode === "text" || answer.mode === "voice")) {
+      counts[answer.mode] += 1;
+    }
     return counts;
-  }, { mcq: 0, text: 0, voice: 0 });
-  const updateAnswer = (questionId, patch) =>
-    setAnswers((prev) => ({ ...prev, [questionId]: { ...prev[questionId], ...patch } }));
+  }, { text: 0, voice: 0 });
+  const updateAnswer = (questionId, patch) => {
+    setAnswers((previous) => ({
+      ...previous,
+      [questionId]: { ...previous[questionId], ...patch },
+    }));
+  };
   const tradeLabel = t.trades[trade] || trade;
 
-  const start = () => {
-    setAnswers({});
-    setIndex(0);
+  const apiRequest = (path, options = {}) =>
+    requestJson(`${apiBase.replace(/\/$/, "")}${path}`, options, t);
+
+  const fetchCurrentQuestion = async (id) => {
+    const data = await apiRequest(
+      `/api/assessments/${id}/questions/current`
+    );
+    return data.question ? validateQuestion(data.question, t) : null;
+  };
+
+  const showQuestion = (currentQuestion, loadedQuestions) => {
+    const updatedQuestions = mergeQuestions(loadedQuestions, [currentQuestion]);
+    setQuestions(updatedQuestions);
+    setIndex(updatedQuestions.findIndex(
+      (item) => item.question_id === currentQuestion.question_id
+    ));
     setPhase("questions");
+  };
+
+  const continueFromBackend = async (id, loadedQuestions) => {
+    const currentQuestion = await fetchCurrentQuestion(id);
+    if (currentQuestion) {
+      showQuestion(currentQuestion, loadedQuestions);
+      return;
+    }
+
+    const progress = await apiRequest(`/api/assessments/${id}`);
+    if (!Number.isInteger(progress.current_stage)) {
+      throw new Error(t.invalidResponse);
+    }
+
+    if (progress.current_stage < 3) {
+      const advanced = await apiRequest(
+        `/api/assessments/${id}/stages/next`,
+        { method: "POST" }
+      );
+      const stageQuestions = Array.isArray(advanced.questions)
+        ? advanced.questions.map((item) => validateQuestion(item, t))
+        : [];
+      const questionsWithStage = mergeQuestions(loadedQuestions, stageQuestions);
+      setQuestions(questionsWithStage);
+      const nextQuestion = await fetchCurrentQuestion(id);
+      if (!nextQuestion) throw new Error(t.noCurrentQuestion);
+      showQuestion(nextQuestion, questionsWithStage);
+      return;
+    }
+
+    if (
+      progress.current_stage === 3 &&
+      progress.answered_question_count === TOTAL_QUESTIONS
+    ) {
+      setQuestions(loadedQuestions);
+      setPhase("review");
+      return;
+    }
+
+    throw new Error(t.incompleteAssessment);
+  };
+
+  const start = async () => {
+    if (!hasValidWorkerId) {
+      setApiError(t.invalidWorkerId);
+      return;
+    }
+    setIsLoading(true);
+    setLoadingLabel(t.starting);
+    setApiError("");
+    try {
+      let id = assessmentId;
+      let loadedQuestions = questions;
+      if (id == null) {
+        const created = await apiRequest("/api/assessments", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ worker_id: workerId, language: lang }),
+        });
+        if (
+          !Number.isInteger(created.assessment_id) ||
+          created.worker_id !== workerId ||
+          created.status !== "IN_PROGRESS"
+        ) {
+          throw new Error(t.invalidResponse);
+        }
+        id = created.assessment_id;
+        setAssessmentId(id);
+        loadedQuestions = Array.isArray(created.questions)
+          ? created.questions.map((item) => validateQuestion(item, t))
+          : [];
+        setQuestions(loadedQuestions);
+        setAnswers({});
+      }
+      await continueFromBackend(id, loadedQuestions);
+    } catch (error) {
+      setApiError(error.message || t.requestFailed);
+    } finally {
+      setIsLoading(false);
+      setLoadingLabel("");
+    }
+  };
+
+  const transcribeVoiceAnswer = async (blob) => {
+    if (lang === "hi") throw new Error(t.voiceLanguageUnavailable);
+    const formData = new FormData();
+    formData.append("audio", blob, "assessment-answer.webm");
+    formData.append("language", lang);
+    const data = await apiRequest("/api/voice/transcribe", {
+      method: "POST",
+      body: formData,
+    });
+    if (typeof data.transcript !== "string" || !data.transcript.trim()) {
+      throw new Error(t.invalidTranscript);
+    }
+    return data.transcript.trim();
+  };
+
+  const submitAndContinue = async (currentQuestion, answer) => {
+    const questionId = currentQuestion.question_id;
+    if (answer.submitted) {
+      if (index < questions.length - 1) {
+        setIndex(index + 1);
+      } else if (currentQuestion.question_order === TOTAL_QUESTIONS) {
+        setPhase("review");
+      } else {
+        setIsLoading(true);
+        setLoadingLabel(t.submitting);
+        setApiError("");
+        try {
+          await continueFromBackend(assessmentId, questions);
+        } catch (error) {
+          setApiError(error.message || t.requestFailed);
+        } finally {
+          setIsLoading(false);
+          setLoadingLabel("");
+        }
+      }
+      return;
+    }
+
+    setIsLoading(true);
+    setLoadingLabel(t.submitting);
+    setApiError("");
+    try {
+      let answerText;
+      let answerSource;
+      if (answer.mode === "text") {
+        answerText = answer.text?.trim();
+        answerSource = "TEXT";
+      } else if (answer.mode === "voice") {
+        answerText = answer.transcript || await transcribeVoiceAnswer(answer.voiceBlob);
+        answerSource = "VOICE";
+        updateAnswer(questionId, { transcript: answerText, text: answerText });
+      } else {
+        throw new Error(t.answerRequired);
+      }
+
+      if (!answerText) throw new Error(t.answerRequired);
+      try {
+        await apiRequest(`/api/assessments/${assessmentId}/answers`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            question_id: questionId,
+            answer_text: answerText,
+            answer_source: answerSource,
+          }),
+        });
+      } catch (submissionError) {
+        const progress = await apiRequest(`/api/assessments/${assessmentId}`);
+        if (
+          !Number.isInteger(progress.answered_question_count) ||
+          progress.answered_question_count < currentQuestion.question_order
+        ) {
+          throw submissionError;
+        }
+      }
+      updateAnswer(questionId, { text: answerText, transcript: answer.mode === "voice" ? answerText : undefined, submitted: true });
+      await continueFromBackend(assessmentId, questions);
+    } catch (error) {
+      setApiError(error.message || t.requestFailed);
+    } finally {
+      setIsLoading(false);
+      setLoadingLabel("");
+    }
+  };
+
+  const finishAssessment = async () => {
+    if (assessmentId == null) {
+      setApiError(t.invalidResponse);
+      return;
+    }
+    setIsLoading(true);
+    setLoadingLabel(t.finishing);
+    setApiError("");
+    try {
+      if (!completionSaved) {
+        try {
+          await apiRequest(`/api/assessments/${assessmentId}/complete`, {
+            method: "POST",
+          });
+          setCompletionSaved(true);
+        } catch (completionError) {
+          try {
+            const recoveredResult = await apiRequest(
+              `/api/assessments/${assessmentId}/results`
+            );
+            if (recoveredResult.status === "COMPLETED") {
+              setAssessmentResult(recoveredResult);
+              setPhase("done");
+              return;
+            }
+          } catch (resultError) {
+            if (resultError.status !== 409) throw resultError;
+          }
+          throw completionError;
+        }
+      }
+
+      const result = await apiRequest(
+        `/api/assessments/${assessmentId}/results`
+      );
+      if (result.status !== "COMPLETED") throw new Error(t.invalidResponse);
+      setAssessmentResult(result);
+      setPhase("done");
+    } catch (error) {
+      setApiError(error.message || t.requestFailed);
+    } finally {
+      setIsLoading(false);
+      setLoadingLabel("");
+    }
   };
 
   const languageSwitch = (
@@ -148,6 +436,7 @@ export default function AssessmentFlow({
             type="button"
             className={lang === code ? "active" : ""}
             aria-pressed={lang === code}
+            disabled={isLoading || phase !== "intro"}
             onClick={() => setLang(code)}
           >
             {label}
@@ -159,23 +448,12 @@ export default function AssessmentFlow({
 
   let body;
 
-  if (total === 0) {
-    body = (
-      <section className="result-section">
-        <p className="result-intro">{t.unavailable}</p>
-        <div className="as-actions">
-          <button type="button" className="primary-button" onClick={onExit}>
-            {t.backToProfile}
-          </button>
-        </div>
-      </section>
-    );
-  } else if (phase === "intro") {
+  if (phase === "intro") {
     body = (
       <section className="result-section">
         <span className="section-kicker">{t.kicker}</span>
         <h1>{t.introTitle}</h1>
-        <p className="result-intro">{fill(t.introText, { total })}</p>
+        <p className="result-intro">{t.introText}</p>
 
         <div className="result-card">
           <div className="result-details" style={{ margin: 0, border: 0, padding: 0 }}>
@@ -185,7 +463,7 @@ export default function AssessmentFlow({
             </div>
             <div>
               <small>{t.questionsLabel}</small>
-              <strong>{total}</strong>
+              <strong>{t.adaptiveQuestions}</strong>
             </div>
             <div>
               <small>{t.workerId}</small>
@@ -194,30 +472,39 @@ export default function AssessmentFlow({
           </div>
         </div>
 
+        {!hasValidWorkerId && (
+          <div className="status-message warning-message" role="alert">
+            {t.invalidWorkerId}
+          </div>
+        )}
         <div className="as-actions">
           <button type="button" className="as-button-secondary" onClick={onExit}>
             {t.backToProfile}
           </button>
-          <button type="button" className="primary-button" onClick={start}>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={isLoading || !hasValidWorkerId}
+            onClick={start}
+          >
             {t.start} <span>→</span>
           </button>
         </div>
       </section>
     );
   } else if (phase === "questions") {
-    const question = questions[index];
-    const entry = answers[question.id] || {};
+    const currentQuestion = question;
+    const entry = answers[currentQuestion.question_id] || {};
     const mode = entry.mode || preferredMode;
-    const selected = entry.optionId;
     const text = entry.text || "";
-    const answered = isAnswered(question);
-    const isLast = index === total - 1;
+    const answered = isAnswered(currentQuestion);
+    const isLast = currentQuestion.question_order === total;
 
     body = (
       <section className="onboarding-section">
         <div className="as-progress">
           <div className="as-progress-meta">
-            <span>{fill(t.questionOf, { n: index + 1, total })}</span>
+            <span>{fill(t.questionOf, { n: currentQuestion.question_order, total })}</span>
             <span>{fill(t.answeredCount, { n: answeredCount, total })}</span>
           </div>
           <div
@@ -238,7 +525,7 @@ export default function AssessmentFlow({
         <div className="onboarding-card">
           <span className="section-kicker">{tradeLabel.toUpperCase()}</span>
           <h2 id="as-question-text" className="as-question">
-            {question.text[lang]}
+            {currentQuestion.question_text}
           </h2>
 
           <div className="as-mode">
@@ -256,10 +543,16 @@ export default function AssessmentFlow({
                   type="button"
                   className={mode === value ? "active" : ""}
                   aria-pressed={mode === value}
-                  disabled={isRecording}
+                  disabled={
+                    isRecording ||
+                    isLoading ||
+                    entry.submitted ||
+                    value === "choice" ||
+                    (value === "voice" && lang === "hi")
+                  }
                   onClick={() => {
                     setPreferredMode(value);
-                    updateAnswer(question.id, { mode: value });
+                    updateAnswer(currentQuestion.question_id, { mode: value });
                   }}
                 >
                   {label}
@@ -267,31 +560,13 @@ export default function AssessmentFlow({
               ))}
             </div>
           </div>
+          <p className="privacy-note">{t.choiceUnavailable}</p>
+          {lang === "hi" && (
+            <p className="privacy-note">{t.voiceLanguageUnavailable}</p>
+          )}
 
           {mode === "choice" ? (
-            <div className="as-options" role="radiogroup" aria-labelledby="as-question-text">
-              {question.options.map((option, i) => {
-                const isSelected = selected === option.id;
-                return (
-                  <button
-                    key={option.id}
-                    type="button"
-                    role="radio"
-                    aria-checked={isSelected}
-                    className={`trade-option as-option ${isSelected ? "selected" : ""}`}
-                    onClick={() =>
-                      updateAnswer(question.id, { mode: "choice", optionId: option.id })
-                    }
-                  >
-                    <span className="trade-symbol">{String.fromCharCode(65 + i)}</span>
-                    <span className="trade-info">
-                      <strong>{option.text[lang]}</strong>
-                    </span>
-                    <span className="trade-radio">{isSelected ? "✓" : ""}</span>
-                  </button>
-                );
-              })}
-            </div>
+            <p className="privacy-note">{t.choiceUnavailable}</p>
           ) : mode === "text" ? (
             <div className="as-text">
               <label className="field">
@@ -301,8 +576,9 @@ export default function AssessmentFlow({
                   maxLength={MAX_TEXT}
                   value={text}
                   placeholder={t.textPlaceholder}
+                  disabled={isLoading || entry.submitted}
                   onChange={(event) =>
-                    updateAnswer(question.id, { mode: "text", text: event.target.value })
+                    updateAnswer(currentQuestion.question_id, { mode: "text", text: event.target.value })
                   }
                 />
               </label>
@@ -335,7 +611,8 @@ export default function AssessmentFlow({
                   <button
                     type="button"
                     className="primary-button"
-                    onClick={() => startVoiceRecording(question.id)}
+                    disabled={isLoading || entry.submitted || lang === "hi"}
+                    onClick={() => startVoiceRecording(currentQuestion.question_id)}
                   >
                     {entry.voiceUrl ? t.voiceRerecord : t.voiceStart}
                   </button>
@@ -348,7 +625,7 @@ export default function AssessmentFlow({
 
           {!answered && !isRecording && (
             <p className="privacy-note">
-              {mode === "text" ? t.textHint : mode === "voice" ? t.voiceHint : t.selectHint}
+              {mode === "text" ? t.textHint : t.voiceHint}
             </p>
           )}
 
@@ -356,7 +633,7 @@ export default function AssessmentFlow({
             <button
               type="button"
               className="as-button-secondary"
-              disabled={index === 0 || isRecording}
+              disabled={index === 0 || isRecording || isLoading}
               onClick={() => setIndex(index - 1)}
             >
               ← {t.previous}
@@ -364,8 +641,8 @@ export default function AssessmentFlow({
             <button
               type="button"
               className="primary-button"
-              disabled={!answered || isRecording}
-              onClick={() => (isLast ? setPhase("review") : setIndex(index + 1))}
+              disabled={!answered || isRecording || isLoading}
+              onClick={() => submitAndContinue(currentQuestion, entry)}
             >
               {isLast ? t.reviewAnswers : t.next} <span>→</span>
             </button>
@@ -380,29 +657,27 @@ export default function AssessmentFlow({
         <h1>{t.reviewTitle}</h1>
         <p className="result-intro">{t.reviewText}</p>
         <div className="as-review-list">
-          {questions.map((q, questionIndex) => {
-            const answer = answers[q.id] || {};
-            const selectedOption = q.options.find((option) => option.id === answer.optionId);
-            let answerSummary = t.notAnswered;
-            if (answer.mode === "choice" && selectedOption) answerSummary = selectedOption.text[lang];
-            else if (answer.mode === "text" && answer.text?.trim()) answerSummary = answer.text;
-            else if (answer.mode === "voice" && answer.voiceUrl) answerSummary = t.voiceAnswerSaved;
+          {questions.map((reviewQuestion, questionIndex) => {
+            const answer = answers[reviewQuestion.question_id] || {};
+            const answerSummary = answer.text?.trim() || (
+              answer.mode === "voice" ? t.voiceAnswerSaved : t.notAnswered
+            );
             return (
-              <article className="as-review-item" key={q.id}>
+              <article className="as-review-item" key={reviewQuestion.question_id}>
                 <div className="as-review-heading">
-                  <span className="as-review-number">{questionIndex + 1}</span>
+                  <span className="as-review-number">{reviewQuestion.question_order}</span>
                   <span className="as-review-mode">
-                    {answer.mode === "voice" ? t.modeVoice : answer.mode === "text" ? t.modeType : t.modeChoose}
+                    {answer.mode === "voice" ? t.modeVoice : t.modeType}
                   </span>
                 </div>
-                <h3>{q.text[lang]}</h3>
+                <h3>{reviewQuestion.question_text}</h3>
                 <p className="as-review-answer">{answerSummary}</p>
                 <button
                   type="button"
                   className="as-review-edit"
                   onClick={() => { setIndex(questionIndex); setPhase("questions"); }}
                 >
-                  {t.editAnswer}
+                  {t.viewAnswer}
                 </button>
               </article>
             );
@@ -410,10 +685,15 @@ export default function AssessmentFlow({
         </div>
         <p className="privacy-note as-review-privacy">{t.reviewPrivacy}</p>
         <div className="as-actions as-review-actions">
-          <button type="button" className="as-button-secondary" onClick={() => { setIndex(total - 1); setPhase("questions"); }}>
+          <button type="button" className="as-button-secondary" onClick={() => { setIndex(questions.length - 1); setPhase("questions"); }}>
             {t.backToQuestions}
           </button>
-          <button type="button" className="primary-button" onClick={() => setPhase("done")}>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={isLoading}
+            onClick={finishAssessment}
+          >
             {t.confirmFinish} <span>→</span>
           </button>
         </div>
@@ -464,7 +744,6 @@ export default function AssessmentFlow({
             <h2>{t.answerModeBreakdown}</h2>
             <div className="as-passport-mode-grid">
               {[
-                [t.mcqModeLabel, answerModeCounts.mcq],
                 [t.textModeLabel, answerModeCounts.text],
                 [t.voiceModeLabel, answerModeCounts.voice],
               ].map(([label, count]) => (
@@ -477,6 +756,28 @@ export default function AssessmentFlow({
           </section>
 
           <section className="as-passport-section-block">
+            <h2>{t.assessmentResults}</h2>
+            <div className="as-passport-mode-grid">
+              <div className="as-passport-mode">
+                <span>{t.totalScore}</span>
+                <strong>
+                  {assessmentResult?.total_score ?? t.notProvided}
+                  {" / "}
+                  {assessmentResult?.maximum_score ?? t.notProvided}
+                </strong>
+              </div>
+              <div className="as-passport-mode">
+                <span>{t.percentage}</span>
+                <strong>
+                  {typeof assessmentResult?.score_percentage === "number"
+                    ? `${assessmentResult.score_percentage}%`
+                    : t.notProvided}
+                </strong>
+              </div>
+            </div>
+          </section>
+
+          <section className="as-passport-section-block">
             <h2>{t.evidenceTitle}</h2>
             <div className="as-passport-evidence-grid">
               <article className="as-passport-evidence">
@@ -485,26 +786,31 @@ export default function AssessmentFlow({
               </article>
               <article className="as-passport-evidence">
                 <h3>{t.assessedEvidence}</h3>
-                <strong className="as-passport-evidence-status">{t.awaitingEvaluation}</strong>
+                <strong className="as-passport-evidence-status">{t.evaluationComplete}</strong>
                 <p>{t.assessedEvidenceText}</p>
               </article>
               <article className="as-passport-evidence">
                 <h3>{t.verifiedEvidence}</h3>
-                <strong className="as-passport-evidence-status">{t.notYetVerified}</strong>
+                <strong className="as-passport-evidence-status">{t.viewPassportPrompt}</strong>
                 <p>{t.verifiedEvidenceText}</p>
               </article>
             </div>
           </section>
 
           <p className="as-passport-disclaimer">{t.passportDisclaimer}</p>
-          <div className="status-message as-note" role="status">
-            {t.completeNote}
-          </div>
+          {assessmentResult?.safety_flags?.safety_critical_misconception && (
+            <div className="status-message warning-message" role="status">
+              {t.safetyConcern}
+            </div>
+          )}
         </div>
 
         <div className="as-actions">
           <button type="button" className="primary-button" onClick={onExit}>
             {t.backToProfile}
+          </button>
+          <button type="button" className="primary-button" onClick={onOpenPassport}>
+            {t.openPassport} <span>→</span>
           </button>
         </div>
       </section>
@@ -514,6 +820,17 @@ export default function AssessmentFlow({
   return (
     <div className="as-root" lang={lang}>
       {languageSwitch}
+      {isLoading && (
+        <div className="status-message as-request-status" role="status" aria-live="polite">
+          <span className="loading-spinner" />
+          {loadingLabel}
+        </div>
+      )}
+      {apiError && (
+        <div className="status-message warning-message as-request-status" role="alert">
+          {apiError}
+        </div>
+      )}
       {body}
     </div>
   );

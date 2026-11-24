@@ -5,6 +5,7 @@ import AssessmentFlow from "./assessment/AssessmentFlow";
 import { ASSESSMENT_COPY } from "./assessment/copy";
 import DemoProfilePanel from "./dev/DemoProfilePanel";
 import { buildDemoProfile, DEMO_COPY } from "./dev/demoProfile";
+import SkillPassportPage from "./passport/SkillPassportPage";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -120,6 +121,7 @@ const COPY = {
     skillsIdentified: "Skills identified",
     noSkills: "No skills were identified. You can update your description and try again.",
     selfReportedSkills: "Self-reported",
+    openPassport: "View Skill Passport",
     evidenceDisclaimer: "These skills are currently self-reported. They have not yet been assessed or independently verified.",
     createAnother: "Create another profile",
     footerTagline: "Skills deserve recognition.",
@@ -236,6 +238,7 @@ const COPY = {
     skillsIdentified: "గుర్తించిన నైపుణ్యాలు",
     noSkills: "నైపుణ్యాలు గుర్తించబడలేదు. మీ వివరణను మార్చి మళ్లీ ప్రయత్నించండి.",
     selfReportedSkills: "స్వయంగా తెలిపినవి",
+    openPassport: "నైపుణ్య పాస్‌పోర్ట్ చూడండి",
     evidenceDisclaimer: "ఈ నైపుణ్యాలను మీరు స్వయంగా తెలిపారు. వీటిని ఇంకా అంచనా వేయలేదు లేదా స్వతంత్రంగా ధృవీకరించలేదు.",
     createAnother: "మరో ప్రొఫైల్ రూపొందించండి",
     footerTagline: "నైపుణ్యాలకు గుర్తింపు అవసరం.",
@@ -354,6 +357,7 @@ const COPY = {
     skillsIdentified: "पहचाने गए कौशल",
     noSkills: "कोई कौशल नहीं पहचाना गया। अपना विवरण बदलकर फिर कोशिश करें।",
     selfReportedSkills: "स्वयं बताए गए",
+    openPassport: "कौशल पासपोर्ट देखें",
     evidenceDisclaimer: "ये कौशल अभी स्वयं बताए गए हैं। इनका अभी कौशल आकलन या स्वतंत्र सत्यापन नहीं हुआ है।",
     createAnother: "एक और प्रोफ़ाइल बनाएँ",
     footerTagline: "कौशल को पहचान मिलनी चाहिए।",
@@ -654,7 +658,11 @@ export default function App() {
   return (
     <div className="app-shell" lang={language}>
       <header className="navbar">
-        <button className="brand" onClick={() => setStep("landing")}>
+        <button
+          className="brand"
+          disabled={step === "assessment"}
+          onClick={() => setStep("landing")}
+        >
           <span className="brand-mark">Y</span>
           <span>yogya<span className="brand-dot">.</span></span>
         </button>
@@ -670,7 +678,7 @@ export default function App() {
               className={language === "en" ? "active" : ""}
               onClick={() => setLanguage("en")}
               aria-pressed={language === "en"}
-              disabled={loading || isRecording}
+              disabled={loading || isRecording || step === "assessment"}
             >
               English
             </button>
@@ -678,7 +686,7 @@ export default function App() {
               className={language === "te" ? "active" : ""}
               onClick={() => setLanguage("te")}
               aria-pressed={language === "te"}
-              disabled={loading || isRecording}
+              disabled={loading || isRecording || step === "assessment"}
             >
               తెలుగు
             </button>
@@ -686,12 +694,16 @@ export default function App() {
               className={language === "hi" ? "active" : ""}
               onClick={() => setLanguage("hi")}
               aria-pressed={language === "hi"}
-              disabled={loading || isRecording}
+              disabled={loading || isRecording || step === "assessment"}
             >
               हिन्दी
             </button>
           </div>
-          <button className="nav-cta" onClick={() => setStep("onboard")}>
+          <button
+            className="nav-cta"
+            disabled={step === "assessment"}
+            onClick={() => setStep("onboard")}
+          >
             {text.getStarted} <span>→</span>
           </button>
         </div>
@@ -1095,6 +1107,9 @@ export default function App() {
               <button className="primary-button" onClick={() => setStep("assessment")}>
                 {ASSESSMENT_COPY[language].openCta} <span>→</span>
               </button>
+              <button className="primary-button" onClick={() => setStep("passport")}>
+                {text.openPassport} <span>→</span>
+              </button>
               <button className="primary-button" onClick={resetOnboarding}>
                 {text.createAnother} <span>→</span>
               </button>
@@ -1104,12 +1119,23 @@ export default function App() {
 
         {step === "assessment" && savedResult && (
           <AssessmentFlow
+            apiBase={API_BASE}
             workerId={savedResult.worker_id}
             workerName={name}
             workerLocation={location}
             trade={savedResult.profile.trade}
             initialLanguage={language}
             onExit={() => setStep("result")}
+            onOpenPassport={() => setStep("passport")}
+          />
+        )}
+
+        {step === "passport" && savedResult && (
+          <SkillPassportPage
+            apiBase={API_BASE}
+            language={language}
+            workerId={savedResult.worker_id}
+            onBack={() => setStep("result")}
           />
         )}
       </main>
