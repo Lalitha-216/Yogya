@@ -353,9 +353,46 @@ def _seed_question_bank(connection: sqlite3.Connection) -> None:
         connection.execute(insert_sql, row)
 
 
+def _create_verification_records_schema(connection: sqlite3.Connection) -> None:
+    """Create the independent human verification audit table."""
+    connection.execute(
+        """
+        CREATE TABLE verification_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id INTEGER NOT NULL
+                CHECK (typeof(worker_id) = 'integer' AND worker_id > 0),
+            skill_name TEXT NOT NULL
+                CHECK (length(trim(skill_name)) > 0),
+            assessor_identifier TEXT NOT NULL
+                CHECK (length(trim(assessor_identifier)) > 0),
+            outcome TEXT NOT NULL
+                CHECK (outcome IN ('VERIFIED', 'NOT_VERIFIED')),
+            evidence TEXT NOT NULL
+                CHECK (length(trim(evidence)) > 0),
+            notes TEXT,
+            verified_at TEXT NOT NULL,
+            FOREIGN KEY (worker_id) REFERENCES workers (id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_verification_records_worker_time
+        ON verification_records (worker_id, verified_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_verification_records_worker_skill
+        ON verification_records (worker_id, skill_name)
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "create_assessment_schema", _create_assessment_schema),
     Migration(2, "seed_assessment_question_bank", _seed_question_bank),
+    Migration(3, "create_verification_records", _create_verification_records_schema),
 )
 
 

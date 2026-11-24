@@ -3,6 +3,7 @@ import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, List, Literal
 
@@ -157,6 +158,17 @@ class SubmitAssessmentAnswerRequest(BaseModel):
     question_id: str = Field(min_length=1)
     answer_text: str = Field(min_length=1, max_length=5000)
     answer_source: Literal["VOICE", "TEXT"]
+
+
+class DemoVerificationRequest(BaseModel):
+    """Demo-only assessor input; does not authenticate assessor identity."""
+
+    worker_id: int = Field(gt=0)
+    skill_name: str = Field(min_length=1, max_length=120)
+    assessor_identifier: str = Field(min_length=1, max_length=120)
+    outcome: Literal["VERIFIED", "NOT_VERIFIED"]
+    evidence: str = Field(min_length=1, max_length=5000)
+    notes: str | None = Field(default=None, max_length=5000)
 
 
 # --- Database ----------------------------------------------------------------
@@ -404,6 +416,176 @@ def parse_passport_json(value: str, field_name: str) -> dict | list:
     return {} if field_name == "rubric_feedback_json" else []
 
 
+def normalize_skill_name(skill_name: str) -> str:
+    """Normalize persisted and request skill names consistently."""
+    if not isinstance(skill_name, str):
+        return ""
+    return " ".join(skill_name.strip().casefold().split())
+
+
+def get_verification_skill_context(
+    conn: sqlite3.Connection,
+    worker_id: int,
+) -> tuple[dict[str, str], set[str]]:
+    """Return display names and normalized names from the worker's known context."""
+    display_names: dict[str, str] = {}
+
+    worker_skill_rows = conn.execute(
+        """
+        SELECT skill_name
+        FROM worker_skills
+        WHERE worker_id = ?
+        """,
+        (worker_id,),
+    ).fetchall()
+    for (skill_name,) in worker_skill_rows:
+        normalized = normalize_skill_name(skill_name)
+        if normalized:
+            display_names.setdefault(normalized, skill_name)
+
+    answer_rows = conn.execute(
+        """
+        SELECT aa.rubric_feedback_json, q.skill_tag
+        FROM assessment_answers AS aa
+        JOIN assessments AS a
+          ON a.id = aa.assessment_id
+        JOIN assessment_questions AS aq
+          ON aq.assessment_id = aa.assessment_id
+         AND aq.question_id = aa.question_id
+        JOIN questions AS q
+          ON q.question_id = aa.question_id
+        WHERE aa.assessment_id IN (
+            SELECT id
+            FROM assessments
+            WHERE worker_id = ?
+        )
+        """,
+        (worker_id,),
+    ).fetchall()
+    for feedback_json, skill_tag in answer_rows:
+        normalized_tag = normalize_skill_name(skill_tag)
+        if normalized_tag:
+            display_names.setdefault(normalized_tag, skill_tag)
+        feedback = parse_passport_json(
+            feedback_json,
+            "rubric_feedback_json",
+        )
+        if not isinstance(feedback, dict):
+            continue
+        concept_evaluations = feedback.get("concept_evaluations", [])
+        if not isinstance(concept_evaluations, list):
+            continue
+        for concept in concept_evaluations:
+            if not isinstance(concept, dict):
+                continue
+            if concept.get("demonstrated") is not True:
+                continue
+            concept_name = concept.get("concept")
+            if isinstance(concept_name, str) and concept_name.strip():
+                normalized_concept = normalize_skill_name(concept_name)
+                display_names.setdefault(normalized_concept, concept_name)
+
+    question_rows = conn.execute(
+        """
+        SELECT DISTINCT q.skill_tag
+        FROM assessment_questions AS aq
+        JOIN questions AS q
+          ON q.question_id = aq.question_id
+        JOIN assessments AS a
+          ON a.id = aq.assessment_id
+        WHERE a.worker_id = ?
+        """,
+        (worker_id,),
+    ).fetchall()
+    for (skill_tag,) in question_rows:
+        normalized = normalize_skill_name(skill_tag)
+        if normalized:
+            display_names.setdefault(normalized, skill_tag)
+
+    return display_names, set(display_names)
+
+
+@app.post("/api/verifications")
+def create_demo_verification(payload: DemoVerificationRequest) -> dict:
+    """Record demo human verification; this endpoint does not authenticate assessors."""
+    skill_name = " ".join(payload.skill_name.strip().split())
+    assessor_identifier = " ".join(payload.assessor_identifier.strip().split())
+    evidence = " ".join(payload.evidence.strip().split())
+    notes = " ".join(payload.notes.strip().split()) if payload.notes is not None else None
+
+    if not skill_name:
+        raise HTTPException(status_code=422, detail="skill_name must not be blank.")
+    if not assessor_identifier:
+        raise HTTPException(status_code=422, detail="assessor_identifier must not be blank.")
+    if not evidence:
+        raise HTTPException(status_code=422, detail="evidence must not be blank.")
+    if payload.outcome not in ("VERIFIED", "NOT_VERIFIED"):
+        raise HTTPException(status_code=422, detail="outcome must be VERIFIED or NOT_VERIFIED.")
+
+    verified_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        worker = conn.execute(
+            "SELECT id FROM workers WHERE id = ?",
+            (payload.worker_id,),
+        ).fetchone()
+        if worker is None:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Worker not found")
+
+        display_names, allowed_names = get_verification_skill_context(
+            conn,
+            payload.worker_id,
+        )
+        normalized_skill = normalize_skill_name(skill_name)
+        if normalized_skill not in allowed_names:
+            conn.rollback()
+            raise HTTPException(
+                status_code=422,
+                detail="skill_name is not in the worker's known skill context.",
+            )
+        canonical_skill_name = display_names.get(normalized_skill, skill_name)
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO verification_records (
+                    worker_id, skill_name, assessor_identifier, outcome,
+                    evidence, notes, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.worker_id,
+                    canonical_skill_name,
+                    assessor_identifier,
+                    payload.outcome,
+                    evidence,
+                    notes,
+                    verified_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            logger.error("Demo verification insert failed: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=409,
+                detail="The verification record could not be saved.",
+            )
+        verification_id = cursor.lastrowid
+
+    return {
+        "verification_id": verification_id,
+        "worker_id": payload.worker_id,
+        "skill_name": canonical_skill_name,
+        "assessor_identifier": assessor_identifier,
+        "outcome": payload.outcome,
+        "evidence": evidence,
+        "notes": notes,
+        "verified_at": verified_at,
+        "demo_assessor_access": True,
+        "assessor_identity_authenticated": False,
+    }
+
+
 @app.get("/api/workers/{worker_id}/passport")
 def get_worker_passport(worker_id: int) -> dict:
     """Generate a read-only digital passport from persisted worker and assessment data."""
@@ -629,6 +811,52 @@ def get_worker_passport(worker_id: int) -> dict:
         ):
             safety_summary["safety_critical_misconception"] = True
 
+    with db() as conn:
+        verification_rows = conn.execute(
+            """
+            SELECT skill_name, outcome, evidence, notes,
+                   assessor_identifier, verified_at, id
+            FROM verification_records
+            WHERE worker_id = ?
+            ORDER BY verified_at DESC, id DESC
+            """,
+            (worker_id,),
+        ).fetchall()
+
+    latest_verification_by_skill: dict[str, tuple[object, ...]] = {}
+    for row in verification_rows:
+        normalized = normalize_skill_name(row[0])
+        if normalized and normalized not in latest_verification_by_skill:
+            latest_verification_by_skill[normalized] = row
+
+    verified_skill_entries: dict[str, dict[str, object]] = {}
+    for normalized, row in latest_verification_by_skill.items():
+        skill_name, outcome, evidence, notes, assessor_identifier, verified_at, record_id = row
+        if outcome == "VERIFIED":
+            verified_skill_entries[normalized] = {
+                "skill_name": skill_name,
+                "evidence_level": "INDEPENDENTLY_VERIFIED",
+                "source": "demo_human_verification",
+                "verification_id": record_id,
+                "assessor_identifier": assessor_identifier,
+                "evidence": evidence,
+                "notes": notes,
+                "verified_at": verified_at,
+                "assessor_identity_authenticated": False,
+            }
+
+    if verified_skill_entries:
+        de_deduplicated: dict[str, dict[str, object]] = {}
+        for skill in recognized_skills:
+            normalized = normalize_skill_name(str(skill["skill_name"]))
+            if normalized in verified_skill_entries:
+                de_deduplicated[normalized] = verified_skill_entries[normalized]
+            else:
+                de_deduplicated.setdefault(normalized, skill)
+        for normalized, entry in verified_skill_entries.items():
+            de_deduplicated.setdefault(normalized, entry)
+        recognized_skills = list(de_deduplicated.values())
+
     return {
         "worker_profile": {
             "worker_id": worker[0],
@@ -749,6 +977,39 @@ def get_worker_jobs(worker_id: int, location: str | None = None) -> dict:
                     "evidence_level": "ASSESSED",
                 }
             )
+
+    with db() as conn:
+        verification_rows = conn.execute(
+            """
+            SELECT skill_name, outcome
+            FROM verification_records
+            WHERE worker_id = ?
+            ORDER BY verified_at DESC, id DESC
+            """,
+            (worker_id,),
+        ).fetchall()
+    latest_verification_by_skill: dict[str, str] = {}
+    for skill_name, outcome in verification_rows:
+        normalized = normalize_skill_name(skill_name)
+        if normalized and normalized not in latest_verification_by_skill:
+            latest_verification_by_skill[normalized] = outcome
+    for normalized, outcome in latest_verification_by_skill.items():
+        if outcome != "VERIFIED":
+            continue
+        verified_skill_name = next(
+            (
+                row[0]
+                for row in verification_rows
+                if normalize_skill_name(row[0]) == normalized
+            ),
+            normalized,
+        )
+        worker_skills.append(
+            {
+                "skill_name": verified_skill_name,
+                "evidence_level": "INDEPENDENTLY_VERIFIED",
+            }
+        )
 
     try:
         jobs = load_demo_jobs()

@@ -1120,6 +1120,255 @@ def test_job_matching_non_demonstrated_concept_not_assessed(client, tmp_path):
     )
 
 
+def test_demo_verification_success_is_persisted_and_passport_shows_independent(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            "UPDATE worker_skills SET skill_name = 'Electrical safety', "
+            "evidence_level = 'ASSESSED' WHERE worker_id = ?",
+            (worker_id,),
+        )
+        conn.commit()
+
+    response = client.post(
+        "/api/verifications",
+        json={
+            "worker_id": worker_id,
+            "skill_name": "  electrical   safety ",
+            "assessor_identifier": "DEMO-ASSESSOR-001",
+            "outcome": "VERIFIED",
+            "evidence": "Observed isolation and voltage testing.",
+            "notes": "Demo assessor record",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["outcome"] == "VERIFIED"
+    assert data["demo_assessor_access"] is True
+    assert data["assessor_identity_authenticated"] is False
+
+    passport = client.get(f"/api/workers/{worker_id}/passport").json()
+    electrical = [
+        skill
+        for skill in passport["recognized_skills"]
+        if skill["skill_name"].lower() == "electrical safety"
+    ]
+    assert electrical
+    assert electrical[0]["evidence_level"] == "INDEPENDENTLY_VERIFIED"
+    assert electrical[0]["source"] == "demo_human_verification"
+
+
+def test_verification_rejects_unknown_worker(client):
+    response = client.post(
+        "/api/verifications",
+        json={
+            "worker_id": 9999,
+            "skill_name": "Electrical safety",
+            "assessor_identifier": "DEMO-ASSESSOR-001",
+            "outcome": "VERIFIED",
+            "evidence": "Observed the task.",
+        },
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "worker_id": 1,
+            "skill_name": "Electrical safety",
+            "assessor_identifier": "",
+            "outcome": "VERIFIED",
+            "evidence": "Observed the task.",
+        },
+        {
+            "worker_id": 1,
+            "skill_name": "Electrical safety",
+            "assessor_identifier": "DEMO-ASSESSOR-001",
+            "outcome": "VERIFIED",
+            "evidence": "   ",
+        },
+        {
+            "worker_id": 1,
+            "skill_name": "Electrical safety",
+            "assessor_identifier": "DEMO-ASSESSOR-001",
+            "outcome": "UNKNOWN",
+            "evidence": "Observed the task.",
+        },
+    ],
+)
+def test_verification_invalid_input_returns_422(client, payload):
+    response = client.post("/api/verifications", json=payload)
+    assert response.status_code == 422
+
+
+def test_verification_rejects_unrelated_skill(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+
+    response = client.post(
+        "/api/verifications",
+        json={
+            "worker_id": worker_id,
+            "skill_name": "Spacecraft repair",
+            "assessor_identifier": "DEMO-ASSESSOR-001",
+            "outcome": "VERIFIED",
+            "evidence": "Observed a spacecraft task.",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_latest_not_verified_removes_older_independent_status(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            "UPDATE worker_skills SET skill_name = 'Electrical safety', "
+            "evidence_level = 'ASSESSED' WHERE worker_id = ?",
+            (worker_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO verification_records (
+                worker_id, skill_name, assessor_identifier, outcome,
+                evidence, notes, verified_at
+            ) VALUES (?, 'Electrical safety', 'DEMO-ASSESSOR-001',
+                      'VERIFIED', 'Earlier evidence', NULL,
+                      '2026-01-01T00:00:00+00:00')
+            """,
+            (worker_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO verification_records (
+                worker_id, skill_name, assessor_identifier, outcome,
+                evidence, notes, verified_at
+            ) VALUES (?, '  electrical   safety ', 'DEMO-ASSESSOR-002',
+                      'NOT_VERIFIED', 'Latest observation', 'No practical pass',
+                      '2026-01-02T00:00:00+00:00')
+            """,
+            (worker_id,),
+        )
+        conn.commit()
+
+    passport = client.get(f"/api/workers/{worker_id}/passport")
+    assert passport.status_code == 200
+    electrical = [
+        skill
+        for skill in passport.json()["recognized_skills"]
+        if skill["skill_name"].lower() == "electrical safety"
+    ]
+    assert electrical
+    assert electrical[0]["evidence_level"] == "ASSESSED"
+
+    jobs = client.get(f"/api/workers/{worker_id}/jobs").json()["jobs"]
+    electrical_jobs = [
+        skill
+        for job in jobs
+        for skill in job["matched_skills"]
+        if skill["skill_name"].lower() == "electrical safety"
+    ]
+    assert electrical_jobs
+    assert all(
+        skill["evidence_level"] != "INDEPENDENTLY_VERIFIED"
+        for skill in electrical_jobs
+    )
+
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        historical_outcomes = conn.execute(
+            """
+            SELECT outcome
+            FROM verification_records
+            WHERE worker_id = ?
+            ORDER BY id
+            """,
+            (worker_id,),
+        ).fetchall()
+    assert historical_outcomes == [
+        ("VERIFIED",),
+        ("NOT_VERIFIED",),
+    ]
+
+
+def test_verification_skill_normalization_for_case_and_repeated_whitespace(
+    client,
+    tmp_path,
+):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            "UPDATE worker_skills SET skill_name = 'Electrical   safety', "
+            "evidence_level = 'ASSESSED' WHERE worker_id = ?",
+            (worker_id,),
+        )
+        conn.commit()
+
+    verified = client.post(
+        "/api/verifications",
+        json={
+            "worker_id": worker_id,
+            "skill_name": "  ELECTRICAL safety ",
+            "assessor_identifier": "DEMO-NORMALIZATION",
+            "outcome": "VERIFIED",
+            "evidence": "Observed normalized skill evidence.",
+        },
+    )
+
+    assert verified.status_code == 200
+    passport = client.get(f"/api/workers/{worker_id}/passport")
+    assert passport.status_code == 200
+    electrical = [
+        skill
+        for skill in passport.json()["recognized_skills"]
+        if " ".join(skill["skill_name"].lower().split()) == "electrical safety"
+    ]
+    assert electrical
+    assert electrical[0]["evidence_level"] == "INDEPENDENTLY_VERIFIED"
+
+
+def test_verification_audit_history_preserves_records(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute(
+            "UPDATE worker_skills SET skill_name = 'Electrical safety', "
+            "evidence_level = 'SELF_REPORTED' WHERE worker_id = ?",
+            (worker_id,),
+        )
+        conn.commit()
+
+    first = client.post(
+        "/api/verifications",
+        json={
+            "worker_id": worker_id,
+            "skill_name": "Electrical safety",
+            "assessor_identifier": "DEMO-ASSESSOR-001",
+            "outcome": "VERIFIED",
+            "evidence": "Observed the task.",
+        },
+    )
+    second = client.post(
+        "/api/verifications",
+        json={
+            "worker_id": worker_id,
+            "skill_name": "Electrical safety",
+            "assessor_identifier": "DEMO-ASSESSOR-002",
+            "outcome": "NOT_VERIFIED",
+            "evidence": "Observed an incomplete task.",
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        records = conn.execute(
+            "SELECT outcome FROM verification_records "
+            "WHERE worker_id = ? ORDER BY id",
+            (worker_id,),
+        ).fetchall()
+    assert records == [("VERIFIED",), ("NOT_VERIFIED",)]
+
+
 def test_job_matching_demonstrated_concept_is_assessed(client, tmp_path):
     worker_id = insert_assessment_test_worker(tmp_path / "test.db")
     insert_completed_assessment_for_job_evidence(

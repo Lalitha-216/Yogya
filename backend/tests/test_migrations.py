@@ -193,6 +193,31 @@ def test_apply_migrations_creates_tracking_table_and_records_version(tmp_path):
         connection.close()
 
 
+@pytest.mark.parametrize("invalid_worker_id", [0, -1])
+def test_verification_records_reject_non_positive_worker_ids(
+    tmp_path,
+    monkeypatch,
+    invalid_worker_id,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO verification_records (
+                    worker_id, skill_name, assessor_identifier, outcome,
+                    evidence, notes, verified_at
+                ) VALUES (?, 'Electrical safety', 'DEMO-ASSESSOR-001',
+                          'VERIFIED', 'Observed task', NULL,
+                          '2026-01-01T00:00:00+00:00')
+                """,
+                (invalid_worker_id,),
+            )
+    finally:
+        connection.close()
+
+
 def test_migrations_run_in_version_order(tmp_path):
     connection = open_database(tmp_path / "ordered.db")
     execution_order = []
@@ -330,6 +355,7 @@ def test_init_db_preserves_existing_worker_tables_and_records(tmp_path, monkeypa
             ("assessments",),
             ("questions",),
             ("schema_migrations",),
+            ("verification_records",),
             ("worker_skills",),
             ("workers",),
         ]
@@ -579,6 +605,64 @@ def test_assessment_schema_migration_is_registered_once_on_repeated_init(
         ).fetchone() == (4,)
 
 
+def test_verification_records_migration_creates_table_constraints_and_indexes(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = initialize_assessment_database(tmp_path, monkeypatch)
+    connection = open_database(database_path)
+    try:
+        table = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'verification_records'"
+        ).fetchone()
+        assert table == ("verification_records",)
+
+        columns = {
+            row[1]: (row[2], row[3], row[4], row[5])
+            for row in connection.execute(
+                "PRAGMA table_info(verification_records)"
+            )
+        }
+        assert set(columns) == {
+            "id",
+            "worker_id",
+            "skill_name",
+            "assessor_identifier",
+            "outcome",
+            "evidence",
+            "notes",
+            "verified_at",
+        }
+
+        foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(verification_records)"
+        ).fetchall()
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0][2] == "workers"
+        assert foreign_keys[0][6] == "RESTRICT"
+
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert {
+            "idx_verification_records_worker_time",
+            "idx_verification_records_worker_skill",
+        } <= indexes
+        assert connection.execute(
+            "SELECT version, name FROM schema_migrations "
+            "WHERE version = 3"
+        ).fetchone() == (
+            3,
+            "create_verification_records",
+        )
+    finally:
+        connection.close()
+
+
 def test_question_seed_migration_inserts_24_questions_with_expected_trade_counts(
     tmp_path,
     monkeypatch,
@@ -594,7 +678,7 @@ def test_question_seed_migration_inserts_24_questions_with_expected_trade_counts
         assert sum(trade == Trade.PLUMBER.value for _, trade in rows) == 12
         assert {version for version, in connection.execute(
             "SELECT version FROM schema_migrations"
-        )} == {1, 2}
+        )} == {1, 2, 3}
     finally:
         connection.close()
 
@@ -725,7 +809,7 @@ def test_matching_existing_question_content_is_skipped(tmp_path, monkeypatch):
         ).fetchone() == row
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,)]
+        ).fetchall() == [(1,), (2,), (3,)]
     finally:
         connection.close()
 
@@ -766,7 +850,7 @@ def test_conflicting_question_content_raises_and_rolls_back_seed_transaction(
         ]
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,)]
+        ).fetchall() == [(1,), (3,)]
     finally:
         connection.close()
 
@@ -795,7 +879,7 @@ def test_invalid_question_data_is_rejected_without_partial_seed(
         assert connection.execute("SELECT COUNT(*) FROM questions").fetchone() == (0,)
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,)]
+        ).fetchall() == [(1,), (3,)]
     finally:
         connection.close()
 
