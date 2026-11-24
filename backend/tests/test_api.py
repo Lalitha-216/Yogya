@@ -8,6 +8,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from assessment.rubric_evaluator import (
+    ConceptEvaluation,
+    EvaluationResult,
+)
 
 
 class FakeModels:
@@ -237,3 +241,409 @@ def test_cors_allows_vite_origin_only(client):
     bad = client.options("/api/profile/discover", headers={
         "Origin": "http://evil.example", "Access-Control-Request-Method": "POST"})
     assert "access-control-allow-origin" not in bad.headers
+
+
+def insert_assessment_test_worker(db_path, trade="Electrician"):
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")
+    cursor = conn.execute(
+        """
+        INSERT INTO workers (
+            name, language, location, raw_transcript, trade,
+            experience_years, evidence_level
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "API Worker",
+            "en",
+            "Hyderabad",
+            "I have practical trade experience.",
+            trade,
+            5,
+            "SELF_REPORTED",
+        ),
+    )
+    worker_id = cursor.lastrowid
+    conn.execute(
+        """
+        INSERT INTO worker_skills (worker_id, skill_name, evidence_level)
+        VALUES (?, ?, ?)
+        """,
+        (worker_id, "Wiring repair", "SELF_REPORTED"),
+    )
+    conn.commit()
+    conn.close()
+    return worker_id
+
+
+def mock_answer_evaluator(monkeypatch, score=3, safety=False):
+    def evaluator(question, answer, language):
+        del answer, language
+        concept_evaluations = tuple(
+            ConceptEvaluation(
+                concept=concept,
+                demonstrated=True,
+                evidence="I would isolate the supply",
+                rationale=f"The answer supports {concept}.",
+            )
+            for concept in question.expected_concepts
+        )
+        return EvaluationResult(
+            question_id=question.question_id,
+            score=score,
+            concept_evaluations=concept_evaluations,
+            feedback="Answer-specific feedback.",
+            safety_concerns=(),
+            safety_critical_misconception=safety,
+        )
+
+    monkeypatch.setattr(main, "evaluate_answer", evaluator)
+
+
+def test_start_assessment_api_returns_two_stage1_questions(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+
+    response = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["trade"] == "Electrician"
+    assert data["status"] == "IN_PROGRESS"
+    assert data["current_stage"] == 1
+    assert [question["question_id"] for question in data["questions"]] == ["E01", "E02"]
+    assert all(question["question_order"] in (1, 2) for question in data["questions"])
+
+
+def test_start_assessment_rejects_unknown_worker(client):
+    response = client.post(
+        "/api/assessments",
+        json={"worker_id": 9999, "language": "en"},
+    )
+    assert response.status_code == 404
+
+
+def test_start_assessment_rejects_invalid_language(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    response = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "fr"},
+    )
+    assert response.status_code == 422
+
+
+def test_start_assessment_rejects_active_duplicate(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assert client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).status_code == 200
+
+    response = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "te"},
+    )
+    assert response.status_code == 409
+
+
+def test_assessment_progress_and_current_question(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "hi"},
+    ).json()
+
+    progress = client.get(f"/api/assessments/{assessment['assessment_id']}").json()
+    current = client.get(
+        f"/api/assessments/{assessment['assessment_id']}/questions/current"
+    ).json()
+
+    assert progress["assigned_question_count"] == 2
+    assert progress["answered_question_count"] == 0
+    assert progress["current_stage"] == 1
+    assert current["question"]["question_id"] == "E01"
+
+
+@pytest.mark.parametrize("answer_source", ["TEXT", "VOICE"])
+def test_submit_answer_returns_score_feedback_and_safety(
+    client,
+    tmp_path,
+    monkeypatch,
+    answer_source,
+):
+    mock_answer_evaluator(monkeypatch)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+
+    response = client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json={
+            "question_id": "E01",
+            "answer_text": "I would isolate the supply and use a tester.",
+            "answer_source": answer_source,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["question_id"] == "E01"
+    assert data["score"] == 3
+    assert data["feedback"] == "Answer-specific feedback."
+    assert data["safety_critical_misconception"] is False
+    assert data["safety_concerns"] == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"question_id": "E01", "answer_text": "   ", "answer_source": "TEXT"},
+        {"question_id": "E01", "answer_text": "Answer", "answer_source": "AUDIO"},
+    ],
+)
+def test_submit_answer_rejects_invalid_input(client, tmp_path, payload):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    response = client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json=payload,
+    )
+    assert response.status_code in (422, 400)
+
+
+def test_duplicate_answer_returns_conflict(client, tmp_path, monkeypatch):
+    mock_answer_evaluator(monkeypatch)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    body = {
+        "question_id": "E01",
+        "answer_text": "I would isolate the supply.",
+        "answer_source": "TEXT",
+    }
+    assert client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json=body,
+    ).status_code == 200
+    response = client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json=body,
+    )
+    assert response.status_code == 409
+
+
+def test_unassigned_question_returns_validation_error(client, tmp_path, monkeypatch):
+    mock_answer_evaluator(monkeypatch)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    response = client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json={
+            "question_id": "E05",
+            "answer_text": "Worker answer",
+            "answer_source": "TEXT",
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_stage_next_selects_stage2_and_stage3(client, tmp_path, monkeypatch):
+    mock_answer_evaluator(monkeypatch, score=4)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    assessment_id = assessment["assessment_id"]
+
+    for question_id in ("E01", "E02"):
+        assert client.post(
+            f"/api/assessments/{assessment_id}/answers",
+            json={
+                "question_id": question_id,
+                "answer_text": "I would isolate the supply.",
+                "answer_source": "TEXT",
+            },
+        ).status_code == 200
+    stage2 = client.post(
+        f"/api/assessments/{assessment_id}/stages/next"
+    )
+    assert stage2.status_code == 200
+    stage2_data = stage2.json()
+    assert stage2_data["stage_number"] == 2
+    assert len(stage2_data["questions"]) == 2
+
+    for question in stage2_data["questions"]:
+        assert client.post(
+            f"/api/assessments/{assessment_id}/answers",
+            json={
+                "question_id": question["question_id"],
+                "answer_text": "I would isolate the supply.",
+                "answer_source": "TEXT",
+            },
+        ).status_code == 200
+    stage3 = client.post(
+        f"/api/assessments/{assessment_id}/stages/next"
+    )
+    assert stage3.status_code == 200
+    stage3_data = stage3.json()
+    assert stage3_data["stage_number"] == 3
+    assert len(stage3_data["questions"]) == 2
+
+
+def test_stage_advancement_rejected_after_only_one_answer(client, tmp_path, monkeypatch):
+    mock_answer_evaluator(monkeypatch, score=4)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    assessment_id = assessment["assessment_id"]
+
+    submitted = client.post(
+        f"/api/assessments/{assessment_id}/answers",
+        json={
+            "question_id": "E01",
+            "answer_text": "I would isolate the supply.",
+            "answer_source": "TEXT",
+        },
+    )
+    assert submitted.status_code == 200
+
+    advancement = client.post(
+        f"/api/assessments/{assessment_id}/stages/next"
+    )
+    assert advancement.status_code == 400
+
+    progress = client.get(
+        f"/api/assessments/{assessment_id}"
+    )
+    assert progress.status_code == 200
+    assert progress.json()["current_stage"] == 1
+    assert progress.json()["answered_question_count"] == 1
+
+
+def test_excessively_long_answer_is_rejected_by_validation(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+
+    response = client.post(
+        f"/api/assessments/{assessment['assessment_id']}/answers",
+        json={
+            "question_id": "E01",
+            "answer_text": "A" * 5001,
+            "answer_source": "TEXT",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_complete_and_results_endpoint(client, tmp_path, monkeypatch):
+    mock_answer_evaluator(monkeypatch, score=4)
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+    assessment_id = assessment["assessment_id"]
+
+    for question_id in ("E01", "E02"):
+        response = client.post(
+            f"/api/assessments/{assessment_id}/answers",
+            json={
+                "question_id": question_id,
+                "answer_text": "I would isolate the supply.",
+                "answer_source": "TEXT",
+            },
+        )
+        assert response.status_code == 200
+    stage2_response = client.post(
+        f"/api/assessments/{assessment_id}/stages/next"
+    )
+    assert stage2_response.status_code == 200
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        stage2_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT question_id FROM assessment_questions "
+                "WHERE assessment_id = ? AND stage_number = 2 "
+                "ORDER BY question_order",
+                (assessment_id,),
+            )
+        ]
+    for question_id in stage2_ids:
+        response = client.post(
+            f"/api/assessments/{assessment_id}/answers",
+            json={
+                "question_id": question_id,
+                "answer_text": "I would isolate the supply.",
+                "answer_source": "TEXT",
+            },
+        )
+        assert response.status_code == 200
+    stage3_response = client.post(
+        f"/api/assessments/{assessment_id}/stages/next"
+    )
+    assert stage3_response.status_code == 200
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        stage3_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT question_id FROM assessment_questions "
+                "WHERE assessment_id = ? AND stage_number = 3 "
+                "ORDER BY question_order",
+                (assessment_id,),
+            )
+        ]
+    for question_id in stage3_ids:
+        response = client.post(
+            f"/api/assessments/{assessment_id}/answers",
+            json={
+                "question_id": question_id,
+                "answer_text": "I would isolate the supply.",
+                "answer_source": "TEXT",
+            },
+        )
+        assert response.status_code == 200
+
+    complete = client.post(
+        f"/api/assessments/{assessment_id}/complete"
+    )
+    assert complete.status_code == 200
+    assert complete.json()["total_score"] == 24
+    assert complete.json()["maximum_score"] == 24
+    assert complete.json()["score_percentage"] == 100.0
+
+    results = client.get(
+        f"/api/assessments/{assessment_id}/results"
+    )
+    assert results.status_code == 200
+    assert results.json()["status"] == "COMPLETED"
+
+
+def test_results_before_completion_returns_conflict(client, tmp_path):
+    worker_id = insert_assessment_test_worker(tmp_path / "test.db")
+    assessment = client.post(
+        "/api/assessments",
+        json={"worker_id": worker_id, "language": "en"},
+    ).json()
+
+    response = client.get(
+        f"/api/assessments/{assessment['assessment_id']}/results"
+    )
+    assert response.status_code == 409

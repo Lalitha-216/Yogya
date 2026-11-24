@@ -15,6 +15,29 @@ from google.genai import types
 from pydantic import BaseModel, Field, ValidationError
 
 from migrations import apply_migrations
+from assessment.lifecycle import (
+    AssessmentLifecycle,
+    LifecycleEvaluationError,
+    LifecyclePersistenceError,
+    LifecycleValidationError,
+)
+from assessment.repository import (
+    ActiveAssessmentExistsError,
+    AssessmentNotFoundError,
+    AssessmentRepository,
+    DuplicateAnswerError,
+    ForeignKeyIntegrityError,
+    RepositoryError,
+    RepositoryValidationError,
+    WorkerNotFoundError,
+)
+from assessment.rubric_evaluator import (
+    EvaluationResponseValidationError,
+    EvaluatorConfigurationError,
+    EvaluatorServiceError,
+    InputValidationError,
+    evaluate_answer,
+)
 
 logger = logging.getLogger("yogya")
 
@@ -122,6 +145,17 @@ class DiscoverRequest(BaseModel):
     location: str = Field(default="", max_length=120)
     selected_trade: Trade
     transcript: str = Field(max_length=MAX_TRANSCRIPT_CHARS)
+
+
+class StartAssessmentRequest(BaseModel):
+    worker_id: int = Field(gt=0)
+    language: Literal["en", "te", "hi"]
+
+
+class SubmitAssessmentAnswerRequest(BaseModel):
+    question_id: str = Field(min_length=1)
+    answer_text: str = Field(min_length=1, max_length=5000)
+    answer_source: Literal["VOICE", "TEXT"]
 
 
 # --- Database ----------------------------------------------------------------
@@ -350,4 +384,376 @@ def get_worker(worker_id: int) -> dict:
         "experience_years": row[6],
         "evidence_level": row[7],
         "skills": [{"skill_name": r[0], "evidence_level": r[1]} for r in skill_rows],
+    }
+
+
+def get_assessment_lifecycle() -> AssessmentLifecycle:
+    """Construct the lifecycle with the existing repository and Gemini evaluator."""
+    repository = AssessmentRepository(db)
+    return AssessmentLifecycle(repository, evaluator=evaluate_answer)
+
+
+def assessment_http_error(exc: Exception) -> HTTPException:
+    """Translate lifecycle and repository exceptions into safe HTTP errors."""
+    if isinstance(exc, WorkerNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, AssessmentNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, ActiveAssessmentExistsError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, DuplicateAnswerError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, LifecycleEvaluationError):
+        logger.error("Assessment answer evaluation produced an invalid or inconsistent result.")
+        return HTTPException(
+            status_code=502,
+            detail="The answer evaluation service could not produce a valid result.",
+        )
+    if isinstance(exc, (
+        EvaluatorConfigurationError,
+        EvaluatorServiceError,
+        EvaluationResponseValidationError,
+        InputValidationError,
+    )):
+        if isinstance(exc, EvaluatorConfigurationError):
+            logger.error("Gemini evaluator configuration failure")
+            return HTTPException(
+                status_code=503,
+                detail="Assessment evaluator is not configured.",
+            )
+        if isinstance(exc, (EvaluatorServiceError, EvaluationResponseValidationError)):
+            logger.error("Gemini evaluator service or response failure")
+            return HTTPException(
+                status_code=502,
+                detail="The answer evaluation service is temporarily unavailable.",
+            )
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, LifecycleValidationError):
+        message = str(exc)
+        if "duplicate" in message.lower() or "already" in message.lower():
+            return HTTPException(status_code=409, detail=message)
+        return HTTPException(status_code=400, detail=message)
+    if isinstance(exc, RepositoryValidationError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, LifecyclePersistenceError):
+        logger.error("Assessment lifecycle persistence failure")
+        return HTTPException(
+            status_code=500,
+            detail="The assessment could not be saved.",
+        )
+    if isinstance(exc, ForeignKeyIntegrityError):
+        logger.error("Assessment database foreign-key integrity failure")
+        return HTTPException(
+            status_code=409,
+            detail="The assessment references invalid database state.",
+        )
+    if isinstance(exc, RepositoryError):
+        logger.error("Assessment repository failure")
+        return HTTPException(
+            status_code=500,
+            detail="The assessment database operation failed.",
+        )
+    return HTTPException(status_code=500, detail="Assessment operation failed.")
+
+
+ASSESSMENT_EXPECTED_EXCEPTIONS = (
+    WorkerNotFoundError,
+    AssessmentNotFoundError,
+    ActiveAssessmentExistsError,
+    DuplicateAnswerError,
+    LifecycleEvaluationError,
+    LifecycleValidationError,
+    LifecyclePersistenceError,
+    RepositoryError,
+    RepositoryValidationError,
+    ForeignKeyIntegrityError,
+    EvaluatorConfigurationError,
+    EvaluatorServiceError,
+    EvaluationResponseValidationError,
+    InputValidationError,
+)
+
+
+def localized_question_text(question, language: str) -> str:
+    """Return the localized question text for the assessment language."""
+    fields = {
+        "en": question.question_text_en,
+        "te": question.question_text_te,
+        "hi": question.question_text_hi,
+    }
+    return fields[language]
+
+
+def serialized_assigned_question(assessment, assignment, question) -> dict:
+    """Serialize one assigned question without exposing raw worker data."""
+    return {
+        "question_id": question.question_id,
+        "stage_number": assignment.stage_number,
+        "question_order": assignment.question_order,
+        "difficulty": question.difficulty.value,
+        "skill_tag": question.skill_tag,
+        "question_text": localized_question_text(
+            question,
+            assessment.language,
+        ),
+    }
+
+
+@app.post("/api/assessments")
+def start_assessment(payload: StartAssessmentRequest) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        result = lifecycle.start_assessment(
+            payload.worker_id,
+            payload.language,
+        )
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected assessment start failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment operation failed.",
+        ) from exc
+
+    assessment = result.assessment
+    questions = [
+        serialized_assigned_question(
+            assessment,
+            result_assignment,
+            question,
+        )
+        for result_assignment, question in zip(
+            lifecycle.repository.get_assigned_questions(assessment.id),
+            result.questions,
+        )
+    ]
+    return {
+        "assessment_id": assessment.id,
+        "worker_id": assessment.worker_id,
+        "trade": assessment.trade.value,
+        "language": assessment.language,
+        "status": assessment.status,
+        "current_stage": assessment.current_stage,
+        "questions": questions,
+    }
+
+
+@app.get("/api/assessments/{assessment_id}")
+def get_assessment(assessment_id: int) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        progress = lifecycle.get_progress(assessment_id)
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected assessment progress failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment operation failed.",
+        ) from exc
+
+    assessment = progress.assessment
+    return {
+        "assessment_id": assessment.id,
+        "worker_id": assessment.worker_id,
+        "trade": assessment.trade.value,
+        "language": assessment.language,
+        "status": assessment.status,
+        "current_stage": assessment.current_stage,
+        "stage2_difficulty": (
+            progress.stage2_difficulty.value
+            if progress.stage2_difficulty is not None
+            else None
+        ),
+        "assigned_question_count": len(progress.assignments),
+        "answered_question_count": len(progress.answers),
+        "completed": assessment.status == "COMPLETED",
+    }
+
+
+@app.get("/api/assessments/{assessment_id}/questions/current")
+def get_current_assessment_question(assessment_id: int) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        current = lifecycle.get_current_question(assessment_id)
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected current-question retrieval failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment operation failed.",
+        ) from exc
+    if current is None:
+        assessment = lifecycle.repository.get_assessment(assessment_id)
+        if assessment.status == "COMPLETED":
+            return {
+                "assessment_id": assessment_id,
+                "status": "COMPLETED",
+                "question": None,
+                "message": "No unanswered questions remain.",
+            }
+        return {
+            "assessment_id": assessment_id,
+            "status": "IN_PROGRESS",
+            "question": None,
+            "message": "Stage advancement or completion is required.",
+        }
+    return {
+        "assessment_id": assessment_id,
+        "status": current.assessment.status,
+        "question": serialized_assigned_question(
+            current.assessment,
+            current.assignment,
+            current.question,
+        ),
+    }
+
+
+@app.post("/api/assessments/{assessment_id}/answers")
+def submit_assessment_answer(
+    assessment_id: int,
+    payload: SubmitAssessmentAnswerRequest,
+) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        submitted = lifecycle.submit_answer(
+            assessment_id,
+            payload.question_id,
+            payload.answer_text,
+            payload.answer_source,
+        )
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected assessment answer submission failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment answer could not be processed.",
+        ) from exc
+
+    return {
+        "assessment_id": assessment_id,
+        "question_id": submitted.answer.question_id,
+        "stage_number": submitted.answer.stage_number,
+        "score": submitted.answer.score,
+        "feedback": submitted.answer.rubric_feedback["feedback"],
+        "concept_evaluations": submitted.answer.rubric_feedback[
+            "concept_evaluations"
+        ],
+        "safety_critical_misconception": (
+            submitted.answer.safety_flag
+        ),
+        "safety_reason": submitted.answer.safety_reason,
+        "safety_concerns": submitted.answer.safety_concerns,
+    }
+
+
+@app.post("/api/assessments/{assessment_id}/stages/next")
+def advance_assessment_stage(assessment_id: int) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        progress = lifecycle.get_progress(assessment_id)
+        current_stage = progress.assessment.current_stage
+        assignment_count = sum(
+            assignment.stage_number == current_stage
+            for assignment in progress.assignments
+        )
+        answer_count = sum(
+            answer.stage_number == current_stage
+            for answer in progress.answers
+        )
+        if (
+            progress.assessment.status == "IN_PROGRESS"
+            and (assignment_count != 2 or answer_count != 2)
+        ):
+            raise LifecycleValidationError(
+                f"Stage {current_stage} must have exactly two assigned "
+                "questions and exactly two persisted answers before advancement."
+            )
+        advanced = lifecycle.advance_stage(assessment_id)
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected assessment stage advancement failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment stage could not be advanced.",
+        ) from exc
+
+    questions = [
+        serialized_assigned_question(
+            advanced.assessment,
+            lifecycle.repository.get_question_assignment(
+                assessment_id,
+                question.question_id,
+            ),
+            question,
+        )
+        for question in advanced.questions
+    ]
+    return {
+        "assessment_id": assessment_id,
+        "stage_number": advanced.stage_number,
+        "stage2_difficulty": (
+            advanced.stage2_difficulty.value
+            if advanced.stage2_difficulty is not None
+            else None
+        ),
+        "recovered_assignment": advanced.recovered_assignment,
+        "questions": questions,
+    }
+
+
+@app.post("/api/assessments/{assessment_id}/complete")
+def complete_assessment(assessment_id: int) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        result = lifecycle.complete_assessment(assessment_id)
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected assessment completion failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment could not be completed.",
+        ) from exc
+    return {
+        "assessment_id": result.assessment_id,
+        "status": result.status,
+        "total_score": result.total_score,
+        "maximum_score": result.maximum_score,
+        "score_percentage": result.score_percentage,
+        "safety_flags": result.safety_flags,
+        "completed_at": result.completed_at,
+    }
+
+
+@app.get("/api/assessments/{assessment_id}/results")
+def get_assessment_results(assessment_id: int) -> dict:
+    lifecycle = get_assessment_lifecycle()
+    try:
+        result = lifecycle.get_result(assessment_id)
+    except ASSESSMENT_EXPECTED_EXCEPTIONS as exc:
+        raise assessment_http_error(exc)
+    except Exception as exc:
+        logger.exception("Unexpected assessment result retrieval failure")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment result could not be retrieved.",
+        ) from exc
+    if result.status != "COMPLETED":
+        raise HTTPException(
+            status_code=409,
+            detail="Assessment result is available only after completion.",
+        )
+    return {
+        "assessment_id": result.assessment_id,
+        "status": result.status,
+        "total_score": result.total_score,
+        "maximum_score": result.maximum_score,
+        "score_percentage": result.score_percentage,
+        "safety_flags": result.safety_flags,
+        "completed_at": result.completed_at,
     }
