@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import "./assessment.css";
 import { ASSESSMENT_COPY, LANGUAGES } from "./copy";
+import { useVoiceCompanion } from "../voice/VoiceCompanion";
 
 const fill = (template, values) =>
   Object.entries(values).reduce(
@@ -12,6 +13,17 @@ const pickLanguage = (code) => (ASSESSMENT_COPY[code] ? code : "en");
 
 const MAX_TEXT = 500; // characters per typed answer
 const TOTAL_QUESTIONS = 6;
+const AUDIO_FILE_EXTENSIONS = {
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "audio/mp4": "m4a",
+  "audio/mpeg": "mp3",
+  "audio/aac": "aac",
+  "audio/aiff": "aiff",
+  "audio/flac": "flac",
+  "audio/opus": "opus",
+  "audio/wav": "wav",
+};
 
 function mergeQuestions(existing, incoming) {
   const byId = new Map(existing.map((question) => [question.question_id, question]));
@@ -72,6 +84,29 @@ async function requestJson(url, options, t) {
   return payload;
 }
 
+function transcriptionFailureMessage(error, t) {
+  const detail = typeof error?.message === "string" ? error.message : "";
+  const status = error?.status;
+  if (detail.includes("SARVAM_API_KEY") || detail.includes("Sarvam rejected the API key")) {
+    return t.transcriptionNotConfigured;
+  }
+  if (detail.includes("30-second REST limit")) return t.transcriptionTooLong;
+  if (detail.includes("credits or quota are exhausted")) return t.transcriptionQuotaExceeded;
+  if (detail.includes("rate limited") || status === 429) return t.transcriptionRateLimited;
+  if (detail.includes("No speech was detected")) return t.transcriptionNoSpeech;
+  if (detail.includes("Empty audio file")) return t.voiceEmpty;
+  if (detail.includes("Audio file is too large")) return t.transcriptionFileTooLarge;
+  if (detail.includes("Unsupported audio format") || status === 415) {
+    return t.transcriptionUnsupported;
+  }
+  if (detail.includes("Sarvam could not process") || status === 422) {
+    return t.transcriptionInvalidAudio;
+  }
+  if (status === 413) return t.transcriptionTooLong;
+  if ([502, 503, 504].includes(status)) return t.transcriptionUnavailable;
+  return t.transcriptionFailed;
+}
+
 /**
  * Assessment questions, evaluation, and results come from the backend.
  * The browser keeps only current-session answer text and recordings for review.
@@ -83,6 +118,7 @@ export default function AssessmentFlow({
   workerLocation,
   trade,
   initialLanguage,
+  onLanguageChange,
   onExit,
   onOpenPassport,
 }) {
@@ -94,6 +130,7 @@ export default function AssessmentFlow({
   const [preferredMode, setPreferredMode] = useState("text");
   const [assessmentId, setAssessmentId] = useState(null);
   const [assessmentResult, setAssessmentResult] = useState(null);
+  const [lastAnswerFeedback, setLastAnswerFeedback] = useState(null);
   const [completionSaved, setCompletionSaved] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState("");
@@ -101,14 +138,70 @@ export default function AssessmentFlow({
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [voiceError, setVoiceError] = useState("");
+  const [transcriptionError, setTranscriptionError] = useState("");
+  const [transcriptionReady, setTranscriptionReady] = useState(false);
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
   const objectUrlsRef = useRef(new Set());
+  const answerSubmissionInProgressRef = useRef(false);
+  const transcriptionRetryInProgressRef = useRef(false);
+  const voice = useVoiceCompanion();
+  const voiceSpeakRef = useRef(voice.speak);
+  const voiceStopRef = useRef(voice.stop);
+  const lastSpeechKeyRef = useRef("");
+  const speechGenerationRef = useRef(0);
+  const spokenFeedbackIdsRef = useRef(new Set());
 
   const t = ASSESSMENT_COPY[lang];
   const total = TOTAL_QUESTIONS;
   const hasValidWorkerId = Number.isInteger(workerId) && workerId > 0;
   const question = questions[index];
+  const currentQuestionAnswer = question ? answers[question.question_id] || {} : {};
+  const currentAnswerMode = currentQuestionAnswer.mode || preferredMode;
+  const currentQuestionInstructions = lang === "hi"
+    ? t.questionHindiInstruction
+    : currentAnswerMode === "voice"
+      ? t.questionVoiceInstruction
+      : t.questionTextInstruction;
+  const currentQuestionSpeech = question
+    ? `${fill(t.questionOf, { n: question.question_order, total })}. ${question.question_text}. ${currentQuestionInstructions}`
+    : "";
+  const currentAnswerFeedback = phase === "questions" &&
+    lastAnswerFeedback?.questionId === question?.question_id
+    ? lastAnswerFeedback
+    : null;
+  const previousAnswerFeedback = phase === "questions" &&
+    lastAnswerFeedback?.questionOrder === question?.question_order - 1
+    ? lastAnswerFeedback
+    : null;
+  const visibleAnswerFeedback = currentAnswerFeedback || previousAnswerFeedback;
+  const reviewAnswerFeedback = phase === "review" &&
+    lastAnswerFeedback?.questionOrder === total
+    ? lastAnswerFeedback
+    : null;
+  const feedbackForAnnouncement =
+    currentAnswerFeedback || previousAnswerFeedback || reviewAnswerFeedback;
+  const feedbackMessage = feedbackForAnnouncement
+    ? feedbackForAnnouncement.feedbackReturned
+      ? `${t.answerFeedbackLabel}. ${feedbackForAnnouncement.text}`
+      : feedbackForAnnouncement.text
+    : "";
+  const speechBaseText = phase === "intro"
+    ? t.introVoiceInstructions
+    : phase === "questions" && question
+      ? currentQuestionSpeech
+      : phase === "review"
+        ? t.reviewVoiceInstructions
+        : phase === "done"
+          ? t.completionVoiceInstructions
+          : "";
+  const speechKey = [
+    lang,
+    phase,
+    question?.question_id || "",
+    phase === "questions" ? currentAnswerMode : "",
+    feedbackForAnnouncement?.questionId || "",
+  ].join(":");
   const isAnswered = (q) => {
     if (!q) return false;
     const a = answers[q.question_id];
@@ -117,6 +210,51 @@ export default function AssessmentFlow({
     if (a.mode === "voice") return Boolean(a.voiceBlob || a.voiceUrl || a.transcript);
     return false;
   };
+
+  useEffect(() => {
+    voiceSpeakRef.current = voice.speak;
+  }, [voice.speak]);
+
+  useEffect(() => {
+    voiceStopRef.current = voice.stop;
+  }, [voice.stop]);
+
+  useEffect(() => {
+    if (speechKey === lastSpeechKeyRef.current || !speechBaseText) return;
+
+    const shouldSpeakFeedback = feedbackForAnnouncement &&
+      !spokenFeedbackIdsRef.current.has(feedbackForAnnouncement.questionId);
+    const speechText = [
+      shouldSpeakFeedback ? feedbackMessage : "",
+      speechBaseText,
+    ].filter(Boolean).join(". ");
+
+    const generation = ++speechGenerationRef.current;
+    voiceStopRef.current();
+    if (isLoading || isRecording) return;
+
+    lastSpeechKeyRef.current = speechKey;
+    if (shouldSpeakFeedback) {
+      spokenFeedbackIdsRef.current.add(feedbackForAnnouncement.questionId);
+    }
+
+    Promise.resolve().then(() => {
+      if (generation === speechGenerationRef.current && !isLoading && !isRecording) {
+        voiceSpeakRef.current(speechText);
+      }
+    });
+  }, [
+    feedbackMessage,
+    feedbackForAnnouncement,
+    isLoading,
+    isRecording,
+    speechKey,
+    speechBaseText,
+  ]);
+
+  useEffect(() => {
+    if (isLoading || isRecording) voiceStopRef.current();
+  }, [isLoading, isRecording]);
 
   useEffect(() => {
     if (!isRecording) return undefined;
@@ -134,6 +272,8 @@ export default function AssessmentFlow({
 
   const startVoiceRecording = async (questionId) => {
     setVoiceError("");
+    setTranscriptionError("");
+    setTranscriptionReady(false);
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
       setVoiceError(t.voiceUnsupported);
       return;
@@ -195,6 +335,10 @@ export default function AssessmentFlow({
     }));
   };
   const tradeLabel = t.trades[trade] || trade;
+  const changeLanguage = (code) => {
+    setLang(code);
+    onLanguageChange?.(code);
+  };
 
   const apiRequest = (path, options = {}) =>
     requestJson(`${apiBase.replace(/\/$/, "")}${path}`, options, t);
@@ -286,6 +430,7 @@ export default function AssessmentFlow({
           : [];
         setQuestions(loadedQuestions);
         setAnswers({});
+        setLastAnswerFeedback(null);
       }
       await continueFromBackend(id, loadedQuestions);
     } catch (error) {
@@ -297,9 +442,11 @@ export default function AssessmentFlow({
   };
 
   const transcribeVoiceAnswer = async (blob) => {
-    if (lang === "hi") throw new Error(t.voiceLanguageUnavailable);
     const formData = new FormData();
-    formData.append("audio", blob, "assessment-answer.webm");
+    const mimeType = blob.type.split(";")[0].trim().toLowerCase();
+    const extension = AUDIO_FILE_EXTENSIONS[mimeType];
+    const filename = extension ? `assessment-answer.${extension}` : "assessment-answer";
+    formData.append("audio", blob, filename);
     formData.append("language", lang);
     const data = await apiRequest("/api/voice/transcribe", {
       method: "POST",
@@ -309,6 +456,43 @@ export default function AssessmentFlow({
       throw new Error(t.invalidTranscript);
     }
     return data.transcript.trim();
+  };
+
+  const retryTranscription = async (currentQuestion, answer) => {
+    if (
+      !answer.voiceBlob ||
+      isLoading ||
+      transcriptionRetryInProgressRef.current
+    ) {
+      return;
+    }
+
+    transcriptionRetryInProgressRef.current = true;
+    setIsLoading(true);
+    setLoadingLabel(t.transcriptionRetrying);
+    setApiError("");
+    setTranscriptionError("");
+    setTranscriptionReady(false);
+
+    let speechMessage = "";
+    try {
+      const transcript = await transcribeVoiceAnswer(answer.voiceBlob);
+      updateAnswer(currentQuestion.question_id, {
+        transcript,
+        text: transcript,
+      });
+      setTranscriptionReady(true);
+      speechMessage = t.transcriptionReady;
+    } catch (error) {
+      speechMessage = transcriptionFailureMessage(error, t);
+      setTranscriptionError(speechMessage);
+    } finally {
+      setIsLoading(false);
+      setLoadingLabel("");
+      transcriptionRetryInProgressRef.current = false;
+    }
+
+    if (speechMessage) voice.speak(speechMessage);
   };
 
   const submitAndContinue = async (currentQuestion, answer) => {
@@ -333,19 +517,32 @@ export default function AssessmentFlow({
       }
       return;
     }
+    if (isLoading || answerSubmissionInProgressRef.current) return;
 
+    answerSubmissionInProgressRef.current = true;
     setIsLoading(true);
     setLoadingLabel(t.submitting);
     setApiError("");
+    setTranscriptionError("");
+    setTranscriptionReady(false);
     try {
       let answerText;
       let answerSource;
+      let feedbackText = "";
+      let feedbackReturned = false;
       if (answer.mode === "text") {
         answerText = answer.text?.trim();
         answerSource = "TEXT";
       } else if (answer.mode === "voice") {
-        answerText = answer.transcript || await transcribeVoiceAnswer(answer.voiceBlob);
         answerSource = "VOICE";
+        try {
+          answerText = answer.transcript || await transcribeVoiceAnswer(answer.voiceBlob);
+        } catch (error) {
+          const message = transcriptionFailureMessage(error, t);
+          setTranscriptionError(message);
+          voice.speak(message);
+          return;
+        }
         updateAnswer(questionId, { transcript: answerText, text: answerText });
       } else {
         throw new Error(t.answerRequired);
@@ -353,7 +550,7 @@ export default function AssessmentFlow({
 
       if (!answerText) throw new Error(t.answerRequired);
       try {
-        await apiRequest(`/api/assessments/${assessmentId}/answers`, {
+        const submission = await apiRequest(`/api/assessments/${assessmentId}/answers`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -362,6 +559,10 @@ export default function AssessmentFlow({
             answer_source: answerSource,
           }),
         });
+        if (typeof submission.feedback === "string" && submission.feedback.trim()) {
+          feedbackText = submission.feedback.trim();
+          feedbackReturned = true;
+        }
       } catch (submissionError) {
         const progress = await apiRequest(`/api/assessments/${assessmentId}`);
         if (
@@ -371,13 +572,28 @@ export default function AssessmentFlow({
           throw submissionError;
         }
       }
-      updateAnswer(questionId, { text: answerText, transcript: answer.mode === "voice" ? answerText : undefined, submitted: true });
+      if (!feedbackText) feedbackText = t.answerReceived;
+      const feedback = {
+        questionId,
+        questionOrder: currentQuestion.question_order,
+        text: feedbackText,
+        feedbackReturned,
+      };
+      setLastAnswerFeedback(feedback);
+      updateAnswer(questionId, {
+        text: answerText,
+        transcript: answer.mode === "voice" ? answerText : undefined,
+        submitted: true,
+        feedback: feedbackText,
+        feedbackReturned,
+      });
       await continueFromBackend(assessmentId, questions);
     } catch (error) {
       setApiError(error.message || t.requestFailed);
     } finally {
       setIsLoading(false);
       setLoadingLabel("");
+      answerSubmissionInProgressRef.current = false;
     }
   };
 
@@ -437,7 +653,7 @@ export default function AssessmentFlow({
             className={lang === code ? "active" : ""}
             aria-pressed={lang === code}
             disabled={isLoading || phase !== "intro"}
-            onClick={() => setLang(code)}
+            onClick={() => changeLanguage(code)}
           >
             {label}
           </button>
@@ -527,6 +743,25 @@ export default function AssessmentFlow({
           <h2 id="as-question-text" className="as-question">
             {currentQuestion.question_text}
           </h2>
+          <button
+            type="button"
+            className="voice-companion-button"
+            disabled={isLoading || isRecording}
+            onClick={() => voice.speak(currentQuestionSpeech)}
+          >
+            {t.listenQuestion}
+          </button>
+          {visibleAnswerFeedback && (
+            <div className="status-message" role="status" aria-live="polite">
+              <strong>
+                {visibleAnswerFeedback.feedbackReturned
+                  ? t.answerFeedbackLabel
+                  : t.answerReceivedLabel}
+                :
+              </strong>{" "}
+              {visibleAnswerFeedback.text}
+            </div>
+          )}
 
           <div className="as-mode">
             <span id="as-mode-label" className="as-mode-label">
@@ -547,11 +782,12 @@ export default function AssessmentFlow({
                     isRecording ||
                     isLoading ||
                     entry.submitted ||
-                    value === "choice" ||
-                    (value === "voice" && lang === "hi")
+                    value === "choice"
                   }
                   onClick={() => {
                     setPreferredMode(value);
+                    setTranscriptionError("");
+                    setTranscriptionReady(false);
                     updateAnswer(currentQuestion.question_id, { mode: value });
                   }}
                 >
@@ -561,9 +797,6 @@ export default function AssessmentFlow({
             </div>
           </div>
           <p className="privacy-note">{t.choiceUnavailable}</p>
-          {lang === "hi" && (
-            <p className="privacy-note">{t.voiceLanguageUnavailable}</p>
-          )}
 
           {mode === "choice" ? (
             <p className="privacy-note">{t.choiceUnavailable}</p>
@@ -611,7 +844,7 @@ export default function AssessmentFlow({
                   <button
                     type="button"
                     className="primary-button"
-                    disabled={isLoading || entry.submitted || lang === "hi"}
+                    disabled={isLoading || entry.submitted}
                     onClick={() => startVoiceRecording(currentQuestion.question_id)}
                   >
                     {entry.voiceUrl ? t.voiceRerecord : t.voiceStart}
@@ -619,6 +852,24 @@ export default function AssessmentFlow({
                 )}
               </div>
               {voiceError && <p className="as-voice-error" role="alert">{voiceError}</p>}
+              {transcriptionError && (
+                <div className="status-message warning-message" role="alert">
+                  <p>{transcriptionError}</p>
+                  <button
+                    type="button"
+                    className="as-button-secondary"
+                    disabled={isLoading || !entry.voiceBlob}
+                    onClick={() => retryTranscription(currentQuestion, entry)}
+                  >
+                    {t.transcriptionRetry}
+                  </button>
+                </div>
+              )}
+              {transcriptionReady && (
+                <p className="status-message" role="status">
+                  {t.transcriptionReady}
+                </p>
+              )}
               <p className="privacy-note">{t.voicePrivacy}</p>
             </div>
           )}
@@ -634,14 +885,23 @@ export default function AssessmentFlow({
               type="button"
               className="as-button-secondary"
               disabled={index === 0 || isRecording || isLoading}
-              onClick={() => setIndex(index - 1)}
+              onClick={() => {
+                setTranscriptionError("");
+                setTranscriptionReady(false);
+                setIndex(index - 1);
+              }}
             >
               ← {t.previous}
             </button>
             <button
               type="button"
               className="primary-button"
-              disabled={!answered || isRecording || isLoading}
+              disabled={
+                !answered ||
+                isRecording ||
+                isLoading ||
+                Boolean(transcriptionError && mode === "voice" && !entry.transcript)
+              }
               onClick={() => submitAndContinue(currentQuestion, entry)}
             >
               {isLast ? t.reviewAnswers : t.next} <span>→</span>
@@ -672,6 +932,17 @@ export default function AssessmentFlow({
                 </div>
                 <h3>{reviewQuestion.question_text}</h3>
                 <p className="as-review-answer">{answerSummary}</p>
+                {answer.feedback && (
+                  <p className="privacy-note">
+                    <strong>
+                      {answer.feedbackReturned
+                        ? t.answerFeedbackLabel
+                        : t.answerReceivedLabel}
+                      :
+                    </strong>{" "}
+                    {answer.feedback}
+                  </p>
+                )}
                 <button
                   type="button"
                   className="as-review-edit"

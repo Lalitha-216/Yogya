@@ -1,8 +1,13 @@
+import asyncio
+import base64
+import binascii
+import io
 import json
 import logging
 import os
 import re
 import sqlite3
+import wave
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +16,7 @@ from typing import Iterator, List, Literal
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
@@ -61,14 +67,22 @@ CORS_ORIGINS = [
     if o.strip()
 ]
 
-MAX_AUDIO_BYTES = 15 * 1024 * 1024  # stays under Gemini's inline request limit
+MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_TRANSCRIPT_CHARS = 5000
+SARVAM_TRANSCRIPTION_URL = "https://api.sarvam.ai/speech-to-text"
+SARVAM_TRANSCRIPTION_MODEL = "saaras:v4"
+SARVAM_TRANSCRIPTION_TIMEOUT_SECONDS = 45
+SARVAM_TRANSCRIPTION_MAX_ATTEMPTS = 3
+SARVAM_TRANSCRIPTION_RETRY_BASE_SECONDS = 0.5
+SARVAM_TRANSCRIPTION_RETRY_MAX_SECONDS = 1.0
+MAX_TTS_TEXT_CHARS = 2000
+TTS_MODEL_NAME = "gemini-3.8-flash-tts"
+TTS_TIMEOUT_SECONDS = 30
 MAX_SKILLS = 20
-NO_SPEECH_SENTINEL = "[NO_SPEECH]"
 
 Trade = Literal["Electrician", "Plumber"]
 
-# Browsers label recordings like "audio/webm;codecs=opus"; Gemini wants the bare type.
+# Browsers label recordings like "audio/webm;codecs=opus"; providers use the base type.
 MIME_ALIASES = {
     "audio/x-wav": "audio/wav",
     "audio/wave": "audio/wav",
@@ -76,7 +90,28 @@ MIME_ALIASES = {
     "audio/x-m4a": "audio/mp4",
     "audio/m4a": "audio/mp4",
     "audio/x-aac": "audio/aac",
+    "audio/x-aiff": "audio/aiff",
+    "audio/x-flac": "audio/flac",
+    "audio/x-ms-wma": "audio/wma",
     "video/webm": "audio/webm",  # some browsers tag audio-only webm as video/webm
+}
+SARVAM_SUPPORTED_AUDIO_TYPES = {
+    "audio/wav",
+    "audio/mpeg",
+    "audio/aac",
+    "audio/aiff",
+    "audio/ogg",
+    "audio/opus",
+    "audio/flac",
+    "audio/mp4",
+    "audio/amr",
+    "audio/wma",
+    "audio/webm",
+}
+SARVAM_LANGUAGE_CODES = {
+    "te": "te-IN",
+    "en": "en-IN",
+    "hi": "hi-IN",
 }
 
 _client: genai.Client | None = None
@@ -131,6 +166,77 @@ def call_gemini(*, allow_transient_fallback: bool = False, **kwargs):
         raise HTTPException(status_code=502, detail="Could not reach Gemini. Please try again.")
 
 
+def _sarvam_error_text(response: httpx.Response) -> str:
+    try:
+        error_text = json.dumps(response.json()).casefold()
+    except ValueError:
+        error_text = response.text.casefold()
+    return re.sub(r"[^a-z0-9]+", " ", error_text)
+
+
+def _sarvam_error_code(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return "unknown"
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    known_codes = {
+        "invalid_request_error",
+        "internal_server_error",
+        "unprocessable_entity_error",
+        "insufficient_quota_error",
+        "invalid_api_key_error",
+        "authentication_error",
+        "not_found_error",
+        "rate_limit_exceeded_error",
+        "model_call_error",
+        "gateway_timeout_error",
+        "billing_service_unavailable_error",
+    }
+    return code if isinstance(code, str) and code in known_codes else "unknown"
+
+
+def _sarvam_quota_exhausted(response: httpx.Response) -> bool:
+    error_text = _sarvam_error_text(response)
+    return any(
+        marker in error_text
+        for marker in (
+            "insufficient credit",
+            "insufficient balance",
+            "insufficient quota",
+            "credit balance",
+            "credits exhausted",
+            "no credits",
+            "quota exceeded",
+            "quota exhausted",
+            "usage quota",
+            "billing",
+        )
+    )
+
+
+def _sarvam_duration_error(response: httpx.Response) -> bool:
+    error_text = _sarvam_error_text(response)
+    return (
+        response.status_code == 413
+        or (
+            any(
+                marker in error_text
+                for marker in ("duration", "audio length", "seconds", "30 sec")
+            )
+            and any(
+                marker in error_text
+                for marker in ("30", "thirty")
+            )
+        )
+    )
+
+
+async def _wait_for_sarvam_retry(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
 # --- Schemas -----------------------------------------------------------------
 class GeminiExtraction(BaseModel):
     """What Gemini is asked to return. evidence_level is deliberately NOT here:
@@ -147,6 +253,11 @@ class GeminiExtraction(BaseModel):
     skills: List[str] = Field(
         description="Concise list of extracted skills in English, e.g. Fan installation, Wiring repair."
     )
+
+
+class VoiceSpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_TTS_TEXT_CHARS)
+    language: Literal["te-IN"]
 
 
 class ExtractedProfile(BaseModel):
@@ -275,7 +386,12 @@ _RULE_BASED_SKILL_PATTERNS = {
             (
                 re.compile(
                     r"\b(?:install(?:ing|ed|ation)?|fit(?:ting|ted)?)\s+"
-                    r"(?:(?:a|the|ceiling|wall|exhaust)\s+){0,2}fans?\b",
+                    r"(?:(?:a|an|the|one|two|some|several|multiple|ceiling|wall|exhaust)\s+){0,2}"
+                    r"fans?\b",
+                    re.IGNORECASE,
+                ),
+                re.compile(
+                    r"\b(?:install(?:ing|ed)?|fit(?:ting|ted)?)\s+lights?\s+and\s+fans?\b",
                     re.IGNORECASE,
                 ),
                 re.compile(r"\bfans?\s+(?:installation|fitting)\b", re.IGNORECASE),
@@ -290,14 +406,91 @@ _RULE_BASED_SKILL_PATTERNS = {
             "Wiring repair",
             (
                 re.compile(
-                    r"\b(?:repair(?:ing|ed|s)?|fix(?:ing|ed|es)?|mend(?:ing|ed)?)\s+"
+                    r"\b(?:repair(?:ing|ed|s)?|fix(?:ing|ed|es)?|mend(?:ing|ed)?|"
+                    r"install(?:ing|ed|ation)?|replace(?:ment|ing|d|s)?)\s+"
                     r"(?:(?:the|electrical)\s+){0,2}(?:wiring|wires?)\b"
                     r"|\b(?:wiring|wires?)\s+(?:repair|repairs|repaired|fix(?:es|ing|ed)?)\b",
                     re.IGNORECASE,
                 ),
                 re.compile(
+                    r"\b(?:repair(?:ing|ed|s)?|fix(?:ing|ed|es)?|install(?:ing|ed)?|"
+                    r"replace(?:d|s|ing)?|work(?:ing)?\s+(?:on|with)|do(?:es|ing)?|"
+                    r"(?:have|has)\s+experience\s+(?:in|with))\s+"
+                    r"(?:(?!\b(?:but|however)\b)[^.!?;,\n]){0,32}"
+                    r"\b(?:electrical\s+)?wiring\b",
+                    re.IGNORECASE,
+                ),
+                re.compile(
+                    r"\b(?:electrical\s+)?wiring\s+(?:work|installation|repair|repairs)\b",
+                    re.IGNORECASE,
+                ),
+                re.compile(
                     r"(?:వైరింగ్|వైర్).{0,24}(?:మరమ్మత్తు|సరిచేయ|బాగుచేయ)"
                     r"|(?:మరమ్మత్తు|సరిచేయ|బాగుచేయ).{0,24}(?:వైరింగ్|వైర్)",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Socket repair",
+            (
+                re.compile(
+                    r"\b(?:repair(?:ing|ed|s)?|fix(?:ing|ed|es)?|install(?:ing|ed|ation)?|"
+                    r"replace(?:ment|ing|d|s)?)\s+"
+                    r"(?:(?:a|an|the|one|two|some|several|multiple|electrical|wall)\s+){0,2}"
+                    r"sockets?\b"
+                    r"|\bsockets?\s+(?:repair|repairs|repaired|installation|replacement)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Switch installation",
+            (
+                re.compile(
+                    r"\b(?:install(?:ing|ed|ation)?|fit(?:ting|ted)?|replace(?:ment|ing|d|s)?|"
+                    r"repair(?:ing|ed|s)?)\s+"
+                    r"(?:(?:a|an|the|one|two|some|several|multiple|electrical|light)\s+){0,2}"
+                    r"switch(?:es)?\b"
+                    r"|\bswitch(?:es)?\s+(?:installation|installing|repair|repairs|replacement)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Circuit breaker work",
+            (
+                re.compile(
+                    r"\b(?:repair(?:ing|ed|s)?|replace(?:ment|ing|d|s)?|install(?:ing|ed|ation)?|"
+                    r"reset(?:ting)?|test(?:ing|ed|s)?|inspect(?:ing|ed|s)?|"
+                    r"troubleshoot(?:ing|ed|s)?|work(?:ing)?\s+on)\s+"
+                    r"(?:(?:a|the|electrical)\s+)?circuit\s+breakers?\b"
+                    r"|\bcircuit\s+breakers?\s+(?:work|repair|installation|replacement)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Electrical fault diagnosis",
+            (
+                re.compile(
+                    r"\b(?:diagnos(?:e|es|ed|ing)|troubleshoot(?:ing|ed|s)?|"
+                    r"identify|identifying|find|finding|locate|locating|trace|tracing|"
+                    r"check(?:ing)?\s+for)\s+(?:(?:an?|the|electrical|wiring)\s+){0,2}"
+                    r"(?:electrical\s+)?(?:faults?|problems?)\b"
+                    r"|\belectrical\s+fault\s+(?:diagnosis|diagnostic(?:s)?)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Light installation",
+            (
+                re.compile(
+                    r"\b(?:install(?:ing|ed|ation)?|fit(?:ting|ted)?|mount(?:ing|ed|s)?)\s+"
+                    r"(?:(?:a|the|ceiling|wall|LED)\s+){0,2}"
+                    r"(?:lights?|lamps?|light\s+fixtures?)\b"
+                    r"|\b(?:light|lamp)\s+(?:installation|fitting)\b",
                     re.IGNORECASE,
                 ),
             ),
@@ -316,6 +509,82 @@ _RULE_BASED_SKILL_PATTERNS = {
                 re.compile(
                     r"(?:పైపు|పైపులు|పైప్).{0,24}(?:ఫిట్టింగ్|అమర్చ|బిగించ|ఇన్?స్టాల్)"
                     r"|(?:ఫిట్టింగ్|అమర్చ|బిగించ|ఇన్?స్టాల్).{0,24}(?:పైపు|పైపులు|పైప్)",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Pipe repair",
+            (
+                re.compile(
+                    r"\b(?:repair(?:ing|ed|s)?|fix(?:ing|ed|es)?|seal(?:ing|ed)?|"
+                    r"replace(?:ment|ing|d|s)?)\s+(?:(?:a|the|water)\s+){0,2}"
+                    r"(?:pipes?|pipework)\b"
+                    r"|\b(?:pipes?|pipework)\s+(?:repair|repairs|repaired|replacement)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Tap installation and repair",
+            (
+                re.compile(
+                    r"\b(?:install(?:ing|ed|ation)?|fit(?:ting|ted)?|repair(?:ing|ed|s)?|"
+                    r"fix(?:ing|ed|es)?|replace(?:ment|ing|d|s)?)\s+"
+                    r"(?:(?:a|the|water)\s+){0,2}(?:taps?|faucets?)\b"
+                    r"|\b(?:taps?|faucets?)\s+"
+                    r"(?:installation|installing|repair|repairs|replacement)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Leak detection",
+            (
+                re.compile(
+                    r"\b(?:detect(?:ing|ed|s)?|identify|identifying|find|finding|"
+                    r"locate|locating|trace|tracing|check(?:ing)?\s+for)\s+"
+                    r"(?:(?:a|the|water)\s+){0,2}(?:leaks?|leakage)\b"
+                    r"|\b(?:leak|leakage)\s+detection\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Drainage work",
+            (
+                re.compile(
+                    r"\b(?:clear(?:ing|ed|s)?|clean(?:ing|ed|s)?|unclog(?:ging|ged|s)?|"
+                    r"repair(?:ing|ed|s)?|install(?:ing|ed|ation)?|maintain(?:ing|ed|s)?)\s+"
+                    r"(?:(?:a|the|water)\s+){0,2}(?:drains?|drainage)\b"
+                    r"|\b(?:drain|drainage)\s+(?:work|cleaning|clearing|repair|installation)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Bathroom fitting",
+            (
+                re.compile(
+                    r"\b(?:fit(?:ting|ted)?|install(?:ing|ed|ation)?|"
+                    r"repair(?:ing|ed|s)?|replace(?:ment|ing|d|s)?)\s+"
+                    r"(?:(?:a|the)\s+)?bathroom\s+(?:fixtures?|fittings?)\b"
+                    r"|\bbathroom\s+fitting\b"
+                    r"|\b(?:install(?:ing|ed)?|fit(?:ting|ted)?|repair(?:ing|ed|s)?|"
+                    r"replace(?:d|s|ing)?)\s+(?:(?:a|the|bathroom)\s+){0,2}"
+                    r"(?:toilets?|showers?|washbasins?|basins?|sinks?)\b",
+                    re.IGNORECASE,
+                ),
+            ),
+        ),
+        (
+            "Water pump installation",
+            (
+                re.compile(
+                    r"\b(?:install(?:ing|ed|ation)?|fit(?:ting|ted)?|"
+                    r"repair(?:ing|ed|s)?|replace(?:ment|ing|d|s)?|"
+                    r"service(?:ing|d|s)?)\s+(?:(?:a|the)\s+)?water\s+pumps?\b"
+                    r"|\bwater\s+pumps?\s+(?:installation|installing|repair|replacement)\b",
                     re.IGNORECASE,
                 ),
             ),
@@ -430,9 +699,9 @@ def extract_rule_based_profile(
     found_skills = []
     for skill_name, patterns in _RULE_BASED_SKILL_PATTERNS[selected_trade]:
         if any(
-            (match := pattern.search(transcript)) is not None
-            and not _is_negated_skill_mention(transcript, match.start(), match.end())
+            not _is_negated_skill_mention(transcript, match.start(), match.end())
             for pattern in patterns
+            for match in pattern.finditer(transcript)
         ):
             found_skills.append(skill_name)
 
@@ -458,14 +727,12 @@ def health() -> dict:
     return {"status": "ok", "gemini_configured": bool(os.getenv("GEMINI_API_KEY", "").strip())}
 
 
-# Plain `def` (not async): the Gemini SDK call is blocking, so FastAPI runs this
-# in its threadpool instead of freezing the event loop.
 @app.post("/api/voice/transcribe")
-def transcribe_audio(
+async def transcribe_audio(
     audio: UploadFile = File(...),
-    language: Literal["te", "en"] = Form("te"),
+    language: Literal["te", "en", "hi"] = Form("te"),
 ) -> dict:
-    audio_bytes = audio.file.read(MAX_AUDIO_BYTES + 1)
+    audio_bytes = await audio.read(MAX_AUDIO_BYTES + 1)
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio file")
     if len(audio_bytes) > MAX_AUDIO_BYTES:
@@ -473,26 +740,231 @@ def transcribe_audio(
 
     mime_type = (audio.content_type or "audio/webm").split(";")[0].strip().lower()
     mime_type = MIME_ALIASES.get(mime_type, mime_type)
-    if not mime_type.startswith("audio/"):
-        raise HTTPException(status_code=415, detail=f"Unsupported file type: {mime_type}")
+    if mime_type not in SARVAM_SUPPORTED_AUDIO_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported audio format: {mime_type}",
+        )
 
-    hint = "Telugu" if language == "te" else "English"
-    response = call_gemini(
-        contents=[
-            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-            "Transcribe this spoken worker experience clearly. The speaker is most likely "
-            f"speaking {hint}, but it may be Telugu/English code-mixed. Keep the speaker's words; "
-            "do not translate or summarise. Return only the plain transcript text. "
-            f"If there is no intelligible speech, return exactly {NO_SPEECH_SENTINEL}.",
-        ],
-    )
-    transcript = (response.text or "").strip()
-    if not transcript or transcript == NO_SPEECH_SENTINEL:
+    api_key = os.getenv("SARVAM_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="SARVAM_API_KEY is not configured on the server. Add it to backend/.env.",
+        )
+
+    form_data = {
+        "model": SARVAM_TRANSCRIPTION_MODEL,
+        "mode": "transcribe",
+        "language_code": SARVAM_LANGUAGE_CODES[language],
+    }
+    files = {
+        "file": (
+            audio.filename or "recording",
+            audio_bytes,
+            mime_type,
+        )
+    }
+    timeout = httpx.Timeout(SARVAM_TRANSCRIPTION_TIMEOUT_SECONDS, connect=5.0)
+    response: httpx.Response | None = None
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as http_client:
+            for attempt in range(SARVAM_TRANSCRIPTION_MAX_ATTEMPTS):
+                response = await http_client.post(
+                    SARVAM_TRANSCRIPTION_URL,
+                    headers={"api-subscription-key": api_key},
+                    data=form_data,
+                    files=files,
+                )
+                retryable = response.status_code == 503 or (
+                    response.status_code == 429
+                    and not _sarvam_quota_exhausted(response)
+                )
+                if not retryable:
+                    break
+                if attempt + 1 == SARVAM_TRANSCRIPTION_MAX_ATTEMPTS:
+                    break
+
+                delay = min(
+                    SARVAM_TRANSCRIPTION_RETRY_BASE_SECONDS * (2**attempt),
+                    SARVAM_TRANSCRIPTION_RETRY_MAX_SECONDS,
+                )
+                await _wait_for_sarvam_retry(delay)
+    except httpx.TimeoutException as exc:
+        logger.error("Sarvam transcription timed out (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=504,
+            detail="Sarvam transcription timed out. Please try recording again.",
+        ) from exc
+    except httpx.TransportError as exc:
+        logger.error("Sarvam transcription transport failure (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Sarvam transcription. Please try again.",
+        ) from exc
+
+    if response is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Sarvam returned no transcription response. Please try again.",
+        )
+    if response.status_code == 503:
+        logger.warning("Sarvam transcription remained unavailable after retries.")
+        raise HTTPException(
+            status_code=503,
+            detail="Sarvam transcription is temporarily unavailable. Please retry.",
+        )
+    if response.status_code == 429:
+        if _sarvam_quota_exhausted(response):
+            raise HTTPException(
+                status_code=429,
+                detail="Sarvam transcription credits or quota are exhausted. Check the Sarvam account.",
+            )
+        raise HTTPException(
+            status_code=429,
+            detail="Sarvam transcription is rate limited. Please retry shortly.",
+        )
+    if response.status_code in (401, 403) or (
+        response.status_code == 400
+        and any(
+            marker in _sarvam_error_text(response)
+            for marker in ("invalid api key", "authentication error")
+        )
+    ):
+        logger.error("Sarvam rejected the configured API key (HTTP %s).", response.status_code)
+        raise HTTPException(
+            status_code=502,
+            detail="Sarvam rejected the API key. Check backend configuration.",
+        )
+    if response.status_code in (400, 413, 422) and _sarvam_duration_error(response):
+        raise HTTPException(
+            status_code=413,
+            detail="Audio exceeds Sarvam's 30-second REST limit. Record a clip no longer than 30 seconds.",
+        )
+    if response.status_code in (400, 422):
+        logger.warning(
+            "Sarvam rejected transcription audio (HTTP %s, code=%s).",
+            response.status_code,
+            _sarvam_error_code(response),
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Sarvam could not process this audio. Check that it is a supported "
+                "recording no longer than 30 seconds."
+            ),
+        )
+    if response.status_code >= 400:
+        logger.error("Sarvam transcription failed with HTTP %s.", response.status_code)
+        raise HTTPException(
+            status_code=502,
+            detail="Sarvam transcription failed. Please try again.",
+        )
+
+    try:
+        result = response.json()
+    except ValueError as exc:
+        logger.error("Sarvam returned a non-JSON transcription response.")
+        raise HTTPException(
+            status_code=502,
+            detail="Sarvam returned an invalid transcription response.",
+        ) from exc
+    transcript = result.get("transcript") if isinstance(result, dict) else None
+    if not isinstance(transcript, str) or not transcript.strip():
         raise HTTPException(
             status_code=422,
             detail="No speech was detected in the audio. Please record again or type your experience.",
         )
+    transcript = transcript.strip()
     return {"transcript": transcript}
+
+
+@app.post("/api/voice/speak")
+def speak_telugu(payload: VoiceSpeakRequest) -> Response:
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Text must not be blank.")
+
+    try:
+        interaction = get_client().interactions.create(
+            model=TTS_MODEL_NAME,
+            input=[{
+                "type": "user_input",
+                "content": [{"type": "text", "text": text}],
+            }],
+            response_format={"type": "audio", "mime_type": "audio/wav"},
+            generation_config={"speech_config": [{"voice": "Kore"}]},
+            api_version="v1beta",
+            timeout=TTS_TIMEOUT_SECONDS,
+        )
+    except HTTPException:
+        raise
+    except genai_errors.APIError as exc:
+        status = getattr(exc, "code", None)
+        if status == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Speech generation is rate limited. Please retry shortly.",
+            ) from exc
+        if status in (408, 504):
+            raise HTTPException(
+                status_code=504,
+                detail="Speech generation timed out. Please try again.",
+            ) from exc
+        logger.error(
+            "Gemini TTS API error (HTTP %s)",
+            status if isinstance(status, int) else "unknown",
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Speech generation failed. Please try again.",
+        ) from exc
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        logger.warning("Gemini TTS request timed out.")
+        raise HTTPException(
+            status_code=504,
+            detail="Speech generation timed out. Please try again.",
+        ) from exc
+    except httpx.TransportError as exc:
+        logger.error("Gemini TTS transport failure (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach the speech service. Please try again.",
+        ) from exc
+    except Exception as exc:
+        logger.error("Unexpected Gemini TTS failure (%s).", type(exc).__name__)
+        raise HTTPException(
+            status_code=502,
+            detail="Speech generation failed. Please try again.",
+        ) from exc
+
+    output_audio = getattr(interaction, "output_audio", None)
+    encoded_audio = getattr(output_audio, "data", None)
+    if not isinstance(encoded_audio, str) or not encoded_audio:
+        logger.error("Gemini TTS returned an empty audio response.")
+        raise HTTPException(
+            status_code=502,
+            detail="Speech service returned no audio. Please try again.",
+        )
+
+    try:
+        audio_bytes = base64.b64decode(encoded_audio, validate=True)
+        with wave.open(io.BytesIO(audio_bytes), "rb") as audio_file:
+            if audio_file.getnframes() == 0:
+                raise wave.Error("empty audio")
+    except (binascii.Error, wave.Error, EOFError, ValueError):
+        logger.error("Gemini TTS returned invalid WAV audio.")
+        raise HTTPException(
+            status_code=502,
+            detail="Speech service returned invalid audio. Please try again.",
+        ) from None
+
+    return Response(
+        content=audio_bytes,
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.post("/api/profile/discover")

@@ -1,0 +1,67 @@
+.voice-companion-controls {
+  position: fixed;
+  z-index: 20;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 32px);
+  padding: 9px;
+  border: 1px solid var(--border, #e9e7f0);
+  border-radius: 12px;
+  background: var(--white, #fff);
+  box-shadow: 0 6px 24px #17152b1c;
+}
+
+.voice-companion-button {
+  min-height: 38px;
+  padding: 8px 11px;
+  border: 1px solid var(--border, #e9e7f0);
+  border-radius: 8px;
+  background: var(--white, #fff);
+  color: var(--ink, #17152b);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.voice-companion-button:hover:not(:disabled) {
+  border-color: var(--purple, #5035c9);
+  color: var(--purple-dark, #3924a0);
+}
+
+.voice-companion-button:focus-visible {
+  outline: 3px solid var(--purple, #5035c9);
+  outline-offset: 2px;
+}
+
+.voice-companion-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.voice-companion-feedback {
+  max-width: 260px;
+  color: var(--muted, #77758a);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+@media (max-width: 620px) {
+  .voice-companion-controls {
+    right: 8px;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    left: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: none;
+  }
+
+  .voice-companion-feedback {
+    flex-basis: 100%;
+    max-width: 100%;
+    text-align: center;
+  }
+}

@@ -15,6 +15,22 @@ export const ASSESSMENT_COPY = {
     introTitle: "Show what you know.",
     introText:
       "Answer the questions selected for your trade. Type each answer or record your voice. The backend evaluates each response and selects the next questions. You can review your answers before final completion.",
+    introVoiceInstructions:
+      "Welcome to your skill assessment. Answer six questions about your trade. You can type your answers, or record them in Telugu or English. Hindi answers must be typed. You can review your answers before finishing.",
+    questionTextInstruction:
+      "Type your answer in your own words. You can write in Telugu, Hindi, or English.",
+    questionVoiceInstruction:
+      "Answer in your own words. Press Start recording, speak in Telugu or English, then press Stop recording. You can listen to it or record again before continuing.",
+    questionHindiInstruction:
+      "Type your answer in Hindi, in your own words. Voice answers are not available in Hindi.",
+    listenQuestion: "Listen to question",
+    answerFeedbackLabel: "Feedback on your answer",
+    answerReceivedLabel: "Answer update",
+    answerReceived: "Your answer was received. You can continue.",
+    reviewVoiceInstructions:
+      "Review your answers before finishing. You can return to a question if needed. Select Confirm and finish to see your results.",
+    completionVoiceInstructions:
+      "Your assessment is complete. Your result summary is shown here. You can open your Skill Passport or return to your profile.",
     tradeLabel: "Trade",
     questionsLabel: "Question set",
     adaptiveQuestions: "Adaptive · 6 total",
@@ -38,7 +54,20 @@ export const ASSESSMENT_COPY = {
     voiceReady: "Recording ready. Play it back or record again.",
     voiceHint: "Record your answer in your own words.",
     voicePrivacy: "Your recording is uploaded for transcription, and the transcript is submitted for assessment.",
-    voiceLanguageUnavailable: "Voice transcription is supported only in Telugu or English. Choose text for Hindi answers.",
+    voiceLanguageUnavailable: "Voice transcription supports Telugu, English, and Hindi.",
+    transcriptionFailed: "We couldn't transcribe the recording. Your audio is still available. Retry transcription, record again, or type your answer.",
+    transcriptionNotConfigured: "Voice transcription is not configured on the server. Please contact the app administrator.",
+    transcriptionTooLong: "This recording exceeds Sarvam's 30-second limit. Record a shorter answer.",
+    transcriptionFileTooLarge: "This audio file is too large. Record a shorter answer or choose a smaller file.",
+    transcriptionRateLimited: "The transcription service is busy. Please wait a moment and retry.",
+    transcriptionQuotaExceeded: "Transcription credits are unavailable. Please contact the app administrator.",
+    transcriptionUnavailable: "The transcription service is temporarily unavailable. Please retry shortly.",
+    transcriptionUnsupported: "This audio format is not supported. Record again using a supported browser.",
+    transcriptionNoSpeech: "No speech was detected. Record again or type your answer.",
+    transcriptionInvalidAudio: "Sarvam couldn't process this recording. Keep it under 30 seconds and try again.",
+    transcriptionRetry: "Retry transcription",
+    transcriptionRetrying: "Retrying transcription…",
+    transcriptionReady: "Transcription is ready. Press Next to submit your answer.",
     voicePermission: "Microphone permission was denied. Allow microphone access and try again.",
     voiceUnsupported: "Voice recording is not supported in this browser. Try a recent version of Chrome.",
     voiceFailed: "Could not start recording. Check your microphone and try again.",
@@ -120,6 +149,8 @@ export const ASSESSMENT_COPY = {
     introTitle: "మీకు తెలిసిన పనిని చూపండి.",
     introText:
       "మీ వృత్తికి అనుగుణంగా ఎంపిక చేసిన ప్రశ్నలకు సమాధానం ఇవ్వండి. సమాధానాలను టైప్ చేయండి లేదా వాయిస్‌లో రికార్డ్ చేయండి. బ్యాకెండ్ ప్రతి సమాధానాన్ని అంచనా వేసి తదుపరి ప్రశ్నలను ఎంపిక చేస్తుంది. చివరగా నిర్ధారించే ముందు మీ సమాధానాలను పరిశీలించవచ్చు.",
+    introVoiceInstructions:
+      "నైపుణ్య అంచనాకు స్వాగతం. మీ పనికి సంబంధించిన ఆరు ప్రశ్నలకు సమాధానం ఇవ్వండి. టైప్ చేయవచ్చు లేదా తెలుగు, ఇంగ్లీష్‌లో రికార్డ్ చేయవచ్చు. హిందీ సమాధానాలను టైప్ చేయాలి. పూర్తి చేసే ముందు సమాధానాలను పరిశీలించవచ్చు.",
     tradeLabel: "వృత్తి",
     questionsLabel: "ప్రశ్నల సమూహం",
     adaptiveQuestions: "అనుకూలంగా ఎంపిక చేసే 6 ప్రశ్నలు",
@@ -142,8 +173,35 @@ export const ASSESSMENT_COPY = {
     voiceRecorded: "మీ రికార్డింగ్",
     voiceReady: "రికార్డింగ్ సిద్ధంగా ఉంది. వినండి లేదా మళ్లీ రికార్డ్ చేయండి.",
     voiceHint: "మీ మాటల్లో సమాధానాన్ని రికార్డ్ చేయండి.",
+    questionVoiceInstruction:
+      "సమాధానాన్ని మీ మాటల్లో చెప్పండి. రికార్డ్ చేయడానికి రికార్డింగ్ ప్రారంభించండి నొక్కి, తెలుగులో లేదా ఇంగ్లీష్‌లో మాట్లాడి, రికార్డింగ్ ఆపండి నొక్కండి. కొనసాగించే ముందు వినవచ్చు లేదా మళ్లీ రికార్డ్ చేయవచ్చు.",
+    questionTextInstruction:
+      "మీ మాటల్లో సమాధానాన్ని టైప్ చేయండి. తెలుగు, హిందీ లేదా ఇంగ్లీష్‌లో రాయవచ్చు.",
+    questionHindiInstruction:
+      "హిందీలో మీ మాటల్లో సమాధానాన్ని టైప్ చేయండి. హిందీ వాయిస్ సమాధానాలు అందుబాటులో లేవు.",
+    listenQuestion: "ప్రశ్న వినండి",
+    answerFeedbackLabel: "మీ సమాధానంపై అభిప్రాయం",
+    answerReceivedLabel: "సమాధానం సమాచారం",
+    answerReceived: "మీ సమాధానం అందింది. కొనసాగించవచ్చు.",
+    reviewVoiceInstructions:
+      "పూర్తి చేసే ముందు సమాధానాలను పరిశీలించండి. అవసరమైతే ప్రశ్నకు తిరిగి వెళ్లండి. ఫలితాలను చూడటానికి నిర్ధారించి పూర్తి చేయండి ఎంచుకోండి.",
+    completionVoiceInstructions:
+      "మీ అంచనా పూర్తయింది. ఫలితాల సారాంశం ఇక్కడ ఉంది. మీ నైపుణ్య పాస్‌పోర్ట్‌ను తెరవవచ్చు లేదా మీ ప్రొఫైల్‌కు తిరిగి వెళ్లవచ్చు.",
     voicePrivacy: "మీ రికార్డింగ్ ట్రాన్స్‌క్రిప్షన్ కోసం అప్‌లోడ్ అవుతుంది. వచ్చిన వచనం అంచనా కోసం సమర్పించబడుతుంది.",
-    voiceLanguageUnavailable: "వాయిస్ ట్రాన్స్‌క్రిప్షన్‌కు తెలుగు, ఇంగ్లీష్ మాత్రమే మద్దతు ఉంది. హిందీ సమాధానాలకు టైప్ చేయండి.",
+    voiceLanguageUnavailable: "వాయిస్ ట్రాన్స్‌క్రిప్షన్‌కు తెలుగు, ఇంగ్లీష్, హిందీ మద్దతు ఉన్నాయి.",
+    transcriptionFailed: "రికార్డింగ్‌ను వచనంగా మార్చలేకపోయాం. మీ ఆడియో అందుబాటులోనే ఉంది. మళ్లీ ప్రయత్నించండి, మళ్లీ రికార్డ్ చేయండి లేదా సమాధానాన్ని టైప్ చేయండి.",
+    transcriptionNotConfigured: "సర్వర్‌లో వాయిస్ ట్రాన్స్‌క్రిప్షన్ సెటప్ కాలేదు. యాప్ నిర్వాహకుడిని సంప్రదించండి.",
+    transcriptionTooLong: "ఈ రికార్డింగ్ Sarvam 30 సెకన్ల పరిమితిని మించింది. చిన్న సమాధానాన్ని రికార్డ్ చేయండి.",
+    transcriptionFileTooLarge: "ఈ ఆడియో ఫైల్ చాలా పెద్దది. చిన్న సమాధానాన్ని రికార్డ్ చేయండి లేదా చిన్న ఫైల్ ఎంచుకోండి.",
+    transcriptionRateLimited: "ట్రాన్స్‌క్రిప్షన్ సేవ బిజీగా ఉంది. కొద్దిసేపు వేచి మళ్లీ ప్రయత్నించండి.",
+    transcriptionQuotaExceeded: "ట్రాన్స్‌క్రిప్షన్ క్రెడిట్‌లు అందుబాటులో లేవు. యాప్ నిర్వాహకుడిని సంప్రదించండి.",
+    transcriptionUnavailable: "ట్రాన్స్‌క్రిప్షన్ సేవ తాత్కాలికంగా అందుబాటులో లేదు. కొద్దిసేపటి తర్వాత ప్రయత్నించండి.",
+    transcriptionUnsupported: "ఈ ఆడియో ఫార్మాట్‌కు మద్దతు లేదు. మద్దతున్న బ్రౌజర్‌లో మళ్లీ రికార్డ్ చేయండి.",
+    transcriptionNoSpeech: "మాటలు గుర్తించబడలేదు. మళ్లీ రికార్డ్ చేయండి లేదా సమాధానాన్ని టైప్ చేయండి.",
+    transcriptionInvalidAudio: "ఈ రికార్డింగ్‌ను Sarvam ప్రాసెస్ చేయలేకపోయింది. 30 సెకన్లలోపు ఉంచి మళ్లీ ప్రయత్నించండి.",
+    transcriptionRetry: "ట్రాన్స్‌క్రిప్షన్‌ను మళ్లీ ప్రయత్నించండి",
+    transcriptionRetrying: "ట్రాన్స్‌క్రిప్షన్‌ను మళ్లీ ప్రయత్నిస్తోంది…",
+    transcriptionReady: "ట్రాన్స్‌క్రిప్షన్ సిద్ధంగా ఉంది. సమాధానాన్ని పంపడానికి తదుపరి నొక్కండి.",
     voicePermission: "మైక్రోఫోన్ అనుమతి నిరాకరించబడింది. అనుమతి ఇచ్చి మళ్లీ ప్రయత్నించండి.",
     voiceUnsupported: "ఈ బ్రౌజర్‌లో వాయిస్ రికార్డింగ్‌కు మద్దతు లేదు. తాజా Chrome ఉపయోగించండి.",
     voiceFailed: "రికార్డింగ్ ప్రారంభించలేకపోయాం. మైక్రోఫోన్‌ను తనిఖీ చేసి మళ్లీ ప్రయత్నించండి.",
@@ -225,6 +283,22 @@ export const ASSESSMENT_COPY = {
     introTitle: "जो आप जानते हैं, वह दिखाइए।",
     introText:
       "अपने काम के अनुसार चुने गए प्रश्नों के उत्तर दीजिए। आप जवाब लिख सकते हैं या बोलकर रिकॉर्ड कर सकते हैं। बैकएंड हर जवाब का मूल्यांकन करके अगले प्रश्न चुनता है। अंतिम पुष्टि से पहले आप अपने जवाब देख सकते हैं।",
+    introVoiceInstructions:
+      "आपके कौशल मूल्यांकन में आपका स्वागत है। अपने काम से जुड़े छह सवालों के जवाब दें। आप जवाब लिख सकते हैं या तेलुगु और अंग्रेज़ी में रिकॉर्ड कर सकते हैं। हिन्दी में जवाब लिखकर दें। पूरा करने से पहले अपने जवाब देख सकते हैं।",
+    questionTextInstruction:
+      "अपना जवाब अपने शब्दों में हिन्दी में लिखें। हिन्दी में बोलकर जवाब देना उपलब्ध नहीं है।",
+    questionVoiceInstruction:
+      "अपना जवाब अपने शब्दों में दें। रिकॉर्ड करने के लिए रिकॉर्डिंग शुरू करें दबाएँ, तेलुगु या अंग्रेज़ी में बोलें, फिर रिकॉर्डिंग रोकें दबाएँ। आगे बढ़ने से पहले सुनें या दोबारा रिकॉर्ड करें।",
+    questionHindiInstruction:
+      "अपना जवाब अपने शब्दों में हिन्दी में लिखें। हिन्दी में बोलकर जवाब देना उपलब्ध नहीं है।",
+    listenQuestion: "सवाल सुनें",
+    answerFeedbackLabel: "आपके जवाब पर प्रतिक्रिया",
+    answerReceivedLabel: "जवाब की जानकारी",
+    answerReceived: "आपका जवाब मिल गया है। अब आगे बढ़ सकते हैं।",
+    reviewVoiceInstructions:
+      "पूरा करने से पहले अपने जवाब जाँचें। ज़रूरत हो तो किसी सवाल पर वापस जाएँ। नतीजे देखने के लिए पुष्टि करें और पूरा करें चुनें।",
+    completionVoiceInstructions:
+      "आपका मूल्यांकन पूरा हो गया है। नतीजों का सारांश यहाँ दिया है। आप अपना कौशल पासपोर्ट खोल सकते हैं या अपनी प्रोफ़ाइल पर लौट सकते हैं।",
     tradeLabel: "काम",
     questionsLabel: "प्रश्नों का सेट",
     adaptiveQuestions: "अनुकूलित · कुल 6",
@@ -248,7 +322,20 @@ export const ASSESSMENT_COPY = {
     voiceReady: "रिकॉर्डिंग तैयार है। इसे सुनें या दोबारा रिकॉर्ड करें।",
     voiceHint: "अपना उत्तर अपने शब्दों में रिकॉर्ड करें।",
     voicePrivacy: "आपकी रिकॉर्डिंग लिखित रूप में बदलने के लिए अपलोड होगी। मिला हुआ पाठ मूल्यांकन के लिए भेजा जाएगा।",
-    voiceLanguageUnavailable: "वॉइस ट्रांसक्रिप्शन केवल तेलुगु या अंग्रेज़ी में उपलब्ध है। हिन्दी जवाब लिखकर दें।",
+    voiceLanguageUnavailable: "वॉइस ट्रांसक्रिप्शन तेलुगु, अंग्रेज़ी और हिन्दी में उपलब्ध है।",
+    transcriptionFailed: "रिकॉर्डिंग को लिखित रूप में नहीं बदल सके। आपका ऑडियो अभी उपलब्ध है। फिर कोशिश करें, दोबारा रिकॉर्ड करें या जवाब लिखें।",
+    transcriptionNotConfigured: "सर्वर पर वॉइस ट्रांसक्रिप्शन सेट नहीं है। कृपया ऐप व्यवस्थापक से संपर्क करें।",
+    transcriptionTooLong: "यह रिकॉर्डिंग Sarvam की 30 सेकंड की सीमा से लंबी है। छोटा जवाब रिकॉर्ड करें।",
+    transcriptionFileTooLarge: "यह ऑडियो फ़ाइल बहुत बड़ी है। छोटा जवाब रिकॉर्ड करें या छोटी फ़ाइल चुनें।",
+    transcriptionRateLimited: "ट्रांसक्रिप्शन सेवा व्यस्त है। थोड़ी देर रुककर फिर कोशिश करें।",
+    transcriptionQuotaExceeded: "ट्रांसक्रिप्शन क्रेडिट उपलब्ध नहीं हैं। कृपया ऐप व्यवस्थापक से संपर्क करें।",
+    transcriptionUnavailable: "ट्रांसक्रिप्शन सेवा कुछ समय के लिए उपलब्ध नहीं है। थोड़ी देर बाद फिर कोशिश करें।",
+    transcriptionUnsupported: "यह ऑडियो फ़ॉर्मैट उपलब्ध नहीं है। समर्थित ब्राउज़र में फिर रिकॉर्ड करें।",
+    transcriptionNoSpeech: "कोई बोली हुई आवाज़ नहीं मिली। फिर रिकॉर्ड करें या जवाब लिखें।",
+    transcriptionInvalidAudio: "Sarvam इस रिकॉर्डिंग को प्रोसेस नहीं कर सका। इसे 30 सेकंड से कम रखें और फिर कोशिश करें।",
+    transcriptionRetry: "ट्रांसक्रिप्शन फिर से आज़माएँ",
+    transcriptionRetrying: "ट्रांसक्रिप्शन फिर से हो रहा है…",
+    transcriptionReady: "ट्रांसक्रिप्शन तैयार है। जवाब जमा करने के लिए अगला दबाएँ।",
     voicePermission: "माइक्रोफ़ोन की अनुमति नहीं मिली। अनुमति देकर फिर कोशिश करें।",
     voiceUnsupported: "यह ब्राउज़र वॉइस रिकॉर्डिंग को सपोर्ट नहीं करता। Chrome का नया संस्करण इस्तेमाल करें।",
     voiceFailed: "रिकॉर्डिंग शुरू नहीं हो सकी। माइक्रोफ़ोन जाँचकर फिर कोशिश करें।",

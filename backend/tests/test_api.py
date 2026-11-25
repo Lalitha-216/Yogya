@@ -1,7 +1,10 @@
 """Backend tests. Gemini is replaced by a fake client here (tests only);
 the application code itself contains no fake/sample behaviour."""
+import base64
+import io
 import json
 import sqlite3
+import wave
 from types import SimpleNamespace
 
 import httpx
@@ -29,6 +32,31 @@ class FakeModels:
         return SimpleNamespace(text=self.reply)
 
 
+class FakeSequenceModels:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def generate_content(self, **kwargs):
+        self.calls.append(kwargs)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return SimpleNamespace(text=reply)
+
+
+class FakeInteractions:
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
 class FakeClient:
     def __init__(self, reply):
         self.models = FakeModels(reply)
@@ -47,6 +75,32 @@ def use_gemini(monkeypatch, reply):
     fake = FakeClient(reply)
     monkeypatch.setattr(main, "get_client", lambda: fake)
     return fake
+
+
+def use_gemini_sequence(monkeypatch, replies):
+    fake = SimpleNamespace(models=FakeSequenceModels(replies))
+    monkeypatch.setattr(main, "get_client", lambda: fake)
+    return fake
+
+
+def gemini_api_error(code):
+    return genai_errors.APIError(code, {"error": {"message": "provider failure"}})
+
+
+def use_gemini_tts(monkeypatch, reply):
+    fake = SimpleNamespace(interactions=FakeInteractions(reply))
+    monkeypatch.setattr(main, "get_client", lambda: fake)
+    return fake
+
+
+def make_test_wav():
+    output = io.BytesIO()
+    with wave.open(output, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(24000)
+        audio.writeframes(b"\0\0" * 24)
+    return output.getvalue()
 
 
 GOOD = json.dumps(
@@ -186,6 +240,32 @@ def test_gemini_503_falls_back_and_persists_profile(client, monkeypatch, tmp_pat
         ).fetchone() == (5, 1, "rule_based_fallback")
 
 
+def test_gemini_failure_extracts_socket_repairing_and_wiring_example(client, monkeypatch):
+    use_gemini(
+        monkeypatch,
+        genai_errors.APIError(503, {"error": {"message": "temporarily unavailable"}}),
+    )
+    transcript = "I have 5 years experience in repairing sockets and wiring."
+
+    response = client.post(
+        "/api/profile/discover",
+        json={**BODY, "language": "en", "transcript": transcript},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["profile"]["experience_years"] == 5
+    assert set(data["profile"]["skills"]) == {"Socket repair", "Wiring repair"}
+    assert data["profile"]["extraction_source"] == "rule_based_fallback"
+    assert data["profile"]["evidence_level"] == "SELF_REPORTED"
+    worker = client.get(f"/api/workers/{data['worker_id']}").json()
+    assert {skill["skill_name"] for skill in worker["skills"]} == {
+        "Socket repair",
+        "Wiring repair",
+    }
+    assert all(skill["evidence_level"] == "SELF_REPORTED" for skill in worker["skills"])
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -262,6 +342,73 @@ def test_rule_based_extraction_supports_telugu_and_ignores_negative_claims():
     ) == (None, [])
 
 
+@pytest.mark.parametrize(
+    ("trade", "transcript", "expected_skills"),
+    [
+        (
+            "Electrician",
+            "I fixed an electrical socket and installed two light switches.",
+            {"Socket repair", "Switch installation"},
+        ),
+        (
+            "Electrician",
+            "I install lights and fans, and repair circuit breakers.",
+            {"Light installation", "Fan installation", "Circuit breaker work"},
+        ),
+        (
+            "Electrician",
+            "I diagnose electrical faults and work on electrical wiring.",
+            {"Electrical fault diagnosis", "Wiring repair"},
+        ),
+        (
+            "Plumber",
+            "I repaired pipes and installed taps.",
+            {"Pipe repair", "Tap installation and repair"},
+        ),
+        (
+            "Plumber",
+            "I detect leaks and clean drains.",
+            {"Leak detection", "Drainage work"},
+        ),
+        (
+            "Plumber",
+            "I fit bathroom fixtures and install water pumps.",
+            {"Bathroom fitting", "Water pump installation"},
+        ),
+    ],
+)
+def test_rule_based_extraction_recognizes_trade_task_variations(
+    trade, transcript, expected_skills
+):
+    experience_years, skills = main.extract_rule_based_profile(transcript, trade)
+    assert experience_years is None
+    assert set(skills) == expected_skills
+
+
+@pytest.mark.parametrize(
+    ("trade", "transcript"),
+    [
+        (
+            "Electrician",
+            "I read about sockets, wiring diagrams, switches, and circuit breakers.",
+        ),
+        (
+            "Plumber",
+            "I read about pipes, taps, leaks, drains, bathroom fixtures, and water pumps.",
+        ),
+    ],
+)
+def test_rule_based_extraction_ignores_unrelated_skill_word_mentions(trade, transcript):
+    assert main.extract_rule_based_profile(transcript, trade) == (None, [])
+
+
+def test_rule_based_extraction_keeps_positive_mention_after_negation():
+    assert main.extract_rule_based_profile(
+        "I don't repair wiring, but I install wiring.",
+        "Electrician",
+    ) == (None, ["Wiring repair"])
+
+
 def test_get_unknown_worker_404(client):
     assert client.get("/api/workers/9999").status_code == 404
 
@@ -313,41 +460,383 @@ def post_audio(client, data=b"fake-audio-bytes", ctype="audio/webm;codecs=opus",
                        files={"audio": ("rec.webm", data, ctype)}, data={"language": language})
 
 
-def test_transcribe_returns_gemini_text_and_normalises_mime(client, monkeypatch):
-    fake = use_gemini(monkeypatch, "  నేను ఐదు సంవత్సరాలు electrician  ")
-    r = post_audio(client)
-    assert r.status_code == 200
-    assert r.json() == {"transcript": "నేను ఐదు సంవత్సరాలు electrician"}
-    part = fake.models.calls[0]["contents"][0]
-    assert part.inline_data.mime_type == "audio/webm"  # codecs suffix stripped
-    assert "Telugu" in fake.models.calls[0]["contents"][1]
+def use_sarvam_responses(monkeypatch, replies, api_key="sarvam-test-key"):
+    monkeypatch.setenv("SARVAM_API_KEY", api_key)
+    requests = []
+
+    def handle_request(request):
+        requests.append(request)
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    transport = httpx.MockTransport(handle_request)
+    original_async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        main.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: original_async_client(
+            *args, transport=transport, **kwargs
+        ),
+    )
+    return requests
 
 
-def test_transcribe_english_hint(client, monkeypatch):
-    fake = use_gemini(monkeypatch, "I fix pipes")
-    post_audio(client, language="en")
-    assert "English" in fake.models.calls[0]["contents"][1]
+def sarvam_response(status_code, payload):
+    return httpx.Response(status_code, json=payload)
 
 
-@pytest.mark.parametrize("reply", ["", "   ", main.NO_SPEECH_SENTINEL])
-def test_transcribe_no_speech_is_422_not_empty_success(client, monkeypatch, reply):
-    use_gemini(monkeypatch, reply)
-    assert post_audio(client).status_code == 422
+def test_transcribe_telugu_uses_sarvam_and_preserves_response_contract(
+    client, monkeypatch
+):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [sarvam_response(200, {
+            "transcript": "నేను ఐదు సంవత్సరాలు electrician",
+            "language_code": "te-IN",
+            "request_id": "request-123",
+        })],
+    )
+
+    response = post_audio(client)
+
+    assert response.status_code == 200
+    assert response.json() == {"transcript": "నేను ఐదు సంవత్సరాలు electrician"}
+    request = requests[0]
+    assert request.url == main.SARVAM_TRANSCRIPTION_URL
+    assert request.headers["api-subscription-key"] == "sarvam-test-key"
+    assert b'name="file"; filename="rec.webm"' in request.content
+    assert b"fake-audio-bytes" in request.content
+    assert b'name="model"' in request.content and b"saaras:v4" in request.content
+    assert b'name="mode"' in request.content and b"transcribe" in request.content
+    assert b'name="language_code"' in request.content and b"te-IN" in request.content
+    assert b"audio/webm" in request.content
 
 
-def test_transcribe_empty_file_400(client, monkeypatch):
-    use_gemini(monkeypatch, "x")
-    assert post_audio(client, data=b"").status_code == 400
+def test_transcribe_english_uses_sarvam_language_code(client, monkeypatch):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [sarvam_response(200, {"transcript": "I fix pipes", "language_code": "en-IN"})],
+    )
+
+    response = post_audio(client, language="en")
+
+    assert response.status_code == 200
+    assert response.json() == {"transcript": "I fix pipes"}
+    assert b"en-IN" in requests[0].content
 
 
-def test_transcribe_rejects_non_audio(client, monkeypatch):
-    use_gemini(monkeypatch, "x")
-    assert post_audio(client, ctype="text/plain").status_code == 415
+def test_transcribe_hindi_uses_sarvam_language_code(client, monkeypatch):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [sarvam_response(200, {"transcript": "मैं पाइप ठीक करता हूँ", "language_code": "hi-IN"})],
+    )
+
+    response = post_audio(client, language="hi")
+
+    assert response.status_code == 200
+    assert response.json() == {"transcript": "मैं पाइप ठीक करता हूँ"}
+    assert b"hi-IN" in requests[0].content
 
 
-def test_transcribe_gemini_failure_is_502(client, monkeypatch):
-    use_gemini(monkeypatch, RuntimeError("boom"))
-    assert post_audio(client).status_code == 502
+def test_transcribe_empty_file_is_rejected_before_provider_request(client, monkeypatch):
+    requests = use_sarvam_responses(monkeypatch, [])
+
+    response = post_audio(client, data=b"")
+
+    assert response.status_code == 400
+    assert requests == []
+
+
+def test_transcribe_oversized_file_is_rejected_before_provider_request(
+    client, monkeypatch
+):
+    requests = use_sarvam_responses(monkeypatch, [])
+    monkeypatch.setattr(main, "MAX_AUDIO_BYTES", 4)
+
+    response = post_audio(client, data=b"12345")
+
+    assert response.status_code == 413
+    assert "too large" in response.json()["detail"]
+    assert requests == []
+
+
+def test_transcribe_missing_sarvam_key_is_clear_and_does_not_call_provider(
+    client, monkeypatch
+):
+    requests = use_sarvam_responses(monkeypatch, [])
+    monkeypatch.delenv("SARVAM_API_KEY")
+
+    response = post_audio(client)
+
+    assert response.status_code == 503
+    assert "SARVAM_API_KEY" in response.json()["detail"]
+    assert requests == []
+
+
+def test_transcribe_rejects_unsupported_audio_format(client, monkeypatch):
+    requests = use_sarvam_responses(monkeypatch, [])
+
+    response = post_audio(client, ctype="text/plain")
+
+    assert response.status_code == 415
+    assert "Unsupported audio format" in response.json()["detail"]
+    assert requests == []
+
+
+def test_transcribe_quota_exhaustion_is_not_retried(client, monkeypatch):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [
+            sarvam_response(
+                429,
+                {
+                    "error": {
+                        "code": "insufficient_quota_error",
+                        "message": "The account quota is exhausted",
+                    }
+                },
+            )
+        ],
+    )
+
+    response = post_audio(client)
+
+    assert response.status_code == 429
+    assert "credits or quota are exhausted" in response.json()["detail"]
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    "first_response",
+    [
+        sarvam_response(
+            429,
+            {
+                "error": {
+                    "code": "rate_limit_exceeded_error",
+                    "message": "Rate limit exceeded, retry soon",
+                }
+            },
+        ),
+        sarvam_response(503, {"error": {"message": "Temporarily unavailable"}}),
+    ],
+)
+def test_transcribe_retries_temporary_sarvam_errors(
+    client, monkeypatch, first_response
+):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [first_response, sarvam_response(200, {"transcript": "recognized words"})],
+    )
+    delays = []
+
+    async def record_delay(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(main, "_wait_for_sarvam_retry", record_delay)
+
+    response = post_audio(client)
+
+    assert response.status_code == 200
+    assert response.json() == {"transcript": "recognized words"}
+    assert len(requests) == 2
+    assert delays == [main.SARVAM_TRANSCRIPTION_RETRY_BASE_SECONDS]
+
+
+def test_transcribe_stops_after_bounded_sarvam_503_retries(client, monkeypatch):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [
+            sarvam_response(503, {"error": {"message": "Temporarily unavailable"}})
+            for _ in range(main.SARVAM_TRANSCRIPTION_MAX_ATTEMPTS)
+        ],
+    )
+    delays = []
+
+    async def record_delay(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(main, "_wait_for_sarvam_retry", record_delay)
+
+    response = post_audio(client)
+
+    assert response.status_code == 503
+    assert len(requests) == main.SARVAM_TRANSCRIPTION_MAX_ATTEMPTS
+    assert delays == [0.5, 1.0]
+
+
+def test_transcribe_timeout_is_reported_without_retry(client, monkeypatch):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [httpx.ReadTimeout("provider timed out")],
+    )
+
+    response = post_audio(client)
+
+    assert response.status_code == 504
+    assert "timed out" in response.json()["detail"]
+    assert len(requests) == 1
+
+
+def test_transcribe_empty_provider_transcript_is_422(client, monkeypatch):
+    use_sarvam_responses(monkeypatch, [sarvam_response(200, {"transcript": "  "})])
+
+    response = post_audio(client)
+
+    assert response.status_code == 422
+    assert "No speech was detected" in response.json()["detail"]
+
+
+def test_transcribe_maps_sarvam_duration_limit_error(client, monkeypatch):
+    use_sarvam_responses(
+        monkeypatch,
+        [
+            sarvam_response(
+                400,
+                {"error": {"message": "Audio duration exceeds the 30 seconds limit"}},
+            )
+        ],
+    )
+
+    response = post_audio(client)
+
+    assert response.status_code == 413
+    assert "30-second REST limit" in response.json()["detail"]
+
+
+def test_transcribe_maps_sarvam_422_without_exposing_provider_details(
+    client, monkeypatch, caplog
+):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [
+            sarvam_response(
+                422,
+                {
+                    "error": {
+                        "code": "unprocessable_entity_error",
+                        "message": "provider-internal validation text",
+                    }
+                },
+            )
+        ],
+    )
+
+    response = post_audio(client)
+
+    assert response.status_code == 422
+    assert "supported recording" in response.json()["detail"]
+    assert "provider-internal" not in response.json()["detail"]
+    assert "code=unprocessable_entity_error" in caplog.text
+    assert len(requests) == 1
+
+
+def test_transcribe_invalid_sarvam_key_is_not_retried(client, monkeypatch):
+    requests = use_sarvam_responses(
+        monkeypatch,
+        [sarvam_response(401, {"error": {"message": "invalid api key"}})],
+    )
+
+    response = post_audio(client)
+
+    assert response.status_code == 502
+    assert "Sarvam rejected the API key" in response.json()["detail"]
+    assert len(requests) == 1
+
+
+# --- Telugu speech generation -----------------------------------------------
+def test_speak_telugu_returns_wav_from_gemini(client, monkeypatch):
+    audio = make_test_wav()
+    interaction = SimpleNamespace(
+        output_audio=SimpleNamespace(data=base64.b64encode(audio).decode("ascii"))
+    )
+    fake = use_gemini_tts(monkeypatch, interaction)
+
+    response = client.post(
+        "/api/voice/speak",
+        json={"text": "యోగ్యకు స్వాగతం", "language": "te-IN"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.content == audio
+    call = fake.interactions.calls[0]
+    assert call["model"] == main.TTS_MODEL_NAME
+    assert call["api_version"] == "v1beta"
+    assert call["response_format"] == {"type": "audio", "mime_type": "audio/wav"}
+    assert call["input"][0]["content"][0]["text"] == "యోగ్యకు స్వాగతం"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"text": "", "language": "te-IN"},
+        {"text": " \n ", "language": "te-IN"},
+        {"text": "x" * (main.MAX_TTS_TEXT_CHARS + 1), "language": "te-IN"},
+        {"text": "తెలుగు", "language": "te"},
+    ],
+)
+def test_speak_telugu_validates_request(client, monkeypatch, payload):
+    fake = use_gemini_tts(monkeypatch, None)
+
+    response = client.post("/api/voice/speak", json=payload)
+
+    assert response.status_code == 422
+    assert fake.interactions.calls == []
+
+
+def test_speak_telugu_requires_server_api_key(client, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    response = client.post(
+        "/api/voice/speak",
+        json={"text": "తెలుగు మాటలు", "language": "te-IN"},
+    )
+
+    assert response.status_code == 503
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected_status"),
+    [
+        (genai_errors.APIError(429, {"error": {"message": "limited"}}), 429),
+        (TimeoutError("request timed out"), 504),
+        (RuntimeError("provider error"), 502),
+    ],
+)
+def test_speak_telugu_maps_provider_failures(
+    client, monkeypatch, reply, expected_status
+):
+    use_gemini_tts(monkeypatch, reply)
+
+    response = client.post(
+        "/api/voice/speak",
+        json={"text": "తెలుగు మాటలు", "language": "te-IN"},
+    )
+
+    assert response.status_code == expected_status
+
+
+@pytest.mark.parametrize(
+    "output_audio",
+    [None, SimpleNamespace(data=""), SimpleNamespace(data="not-base64")],
+)
+def test_speak_telugu_rejects_empty_or_invalid_audio(
+    client, monkeypatch, output_audio
+):
+    fake = use_gemini_tts(
+        monkeypatch, SimpleNamespace(output_audio=output_audio)
+    )
+
+    response = client.post(
+        "/api/voice/speak",
+        json={"text": "తెలుగు మాటలు", "language": "te-IN"},
+    )
+
+    assert response.status_code == 502
+    assert fake.interactions.calls
 
 
 # --- CORS -------------------------------------------------------------------

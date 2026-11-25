@@ -1,5 +1,5 @@
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import AssessmentFlow from "./assessment/AssessmentFlow";
 import { ASSESSMENT_COPY } from "./assessment/copy";
@@ -7,6 +7,11 @@ import DemoProfilePanel from "./dev/DemoProfilePanel";
 import { buildDemoProfile, DEMO_COPY } from "./dev/demoProfile";
 import SkillPassportPage from "./passport/SkillPassportPage";
 import JobRecommendationsPage from "./jobs/JobRecommendationsPage";
+import {
+  VoiceCompanionControls,
+  VoiceCompanionProvider,
+  useVoiceCompanion,
+} from "./voice/VoiceCompanion";
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -40,6 +45,11 @@ const COPY = {
     howItWorks: "How it works",
     whyYogya: "Why Yogya",
     getStarted: "Get started",
+    listenInstructions: "Listen to instructions",
+    landingIntroduction: "Welcome to Yogya. Tell us what work you know. Yogya will help identify and assess your skills. Press Start to begin.",
+    onboardingVoiceGuide: "Welcome to your Yogya profile setup. Enter your name and, if you want, your location. Choose Electrician for wiring, repairs, or installations, or Plumber for pipes, fittings, or maintenance. Then tell us about your work, tasks, tools, and experience. To record, press Start recording, speak, then press Stop recording. You can also type or upload audio.",
+    resultVoiceGuide: "Yogya has identified the skills you described. Review them here. They are self-reported and have not yet been assessed. Next, you can take the assessment or open your Skill Passport.",
+    resultVoiceGuideNoSkills: "Yogya has prepared your profile, but could not identify specific skills from your description yet. Review the guidance here. You can add more detail by creating another profile or continue to the assessment.",
     eyebrow: "SKILLS DESERVE RECOGNITION",
     heroLine1: "Your skills matter.",
     heroLine2: "Your story deserves",
@@ -144,9 +154,12 @@ const COPY = {
     emptyRecording: "No audio was captured. Please record again.",
     microphoneError: "Microphone unavailable. Allow microphone access or type your experience.",
     missingApiKey: "Voice transcription is unavailable because the server is missing its Gemini API key.",
+    missingSarvamApiKey: "Voice transcription is unavailable because the server is missing its Sarvam API key.",
     noSpeech: "No speech was detected. Please record again.",
     audioTooLarge: "The audio file is too large (maximum 15 MB). Record a shorter clip or upload a smaller file.",
+    audioDurationTooLong: "This recording is longer than Sarvam's 30-second limit. Record or upload audio that is 30 seconds or shorter.",
     providerRateLimit: "The transcription service is busy. Please wait a moment and try again.",
+    providerQuotaExceeded: "Sarvam transcription credits or quota are exhausted. Please contact the app administrator.",
     providerRejected: "The transcription service rejected this audio or its model configuration. Try a supported audio format or contact the app administrator.",
     modelUnavailable: "The configured Gemini model is unavailable. Check GEMINI_MODEL and model access.",
     providerUnavailable: "The transcription service is temporarily unavailable. Please try again later.",
@@ -160,6 +173,11 @@ const COPY = {
     howItWorks: "ఇది ఎలా పనిచేస్తుంది",
     whyYogya: "యోగ్యత ఎందుకు",
     getStarted: "ప్రారంభించండి",
+    listenInstructions: "సూచనలు వినండి",
+    landingIntroduction: "యోగ్యకు స్వాగతం. మీకు తెలిసిన పనిని యోగ్యకు చెప్పండి. మీ నైపుణ్యాలను గుర్తించి, అంచనా వేయడానికి యోగ్య సహాయపడుతుంది. ప్రారంభించడానికి ప్రారంభించండి నొక్కండి.",
+    onboardingVoiceGuide: "యోగ్యలో మీ ప్రొఫైల్ ప్రారంభిద్దాం. మీ పేరు నమోదు చేయండి. ప్రాంతం ఇవ్వడం ఐచ్ఛికం. వైరింగ్, మరమ్మతులు లేదా అమరికల పనికి ఎలక్ట్రీషియన్‌ను ఎంచుకోండి. పైపులు, ఫిట్టింగ్‌లు లేదా నిర్వహణ పనికి ప్లంబర్‌ను ఎంచుకోండి. మీ పని, చేసే పనులు, పనిముట్లు, అనుభవం గురించి చెప్పండి. రికార్డ్ చేయడానికి 'రికార్డింగ్ ప్రారంభించండి' నొక్కి మాట్లాడండి. పూర్తయ్యాక 'రికార్డింగ్ ఆపండి' నొక్కండి. టైప్ చేయవచ్చు లేదా ఆడియో అప్‌లోడ్ చేయవచ్చు.",
+    resultVoiceGuide: "మీరు తెలిపిన నైపుణ్యాలను యోగ్య గుర్తించింది. వాటిని ఇక్కడ పరిశీలించండి. ఇవి మీరు తెలిపిన వివరాలు; ఇంకా అంచనా వేయలేదు. తర్వాత నైపుణ్య అంచనా వేయించుకోవచ్చు లేదా మీ నైపుణ్య పాస్‌పోర్ట్‌ను తెరవవచ్చు.",
+    resultVoiceGuideNoSkills: "యోగ్య మీ ప్రొఫైల్‌ను సిద్ధం చేసింది, కానీ మీ వివరణలో నిర్దిష్ట నైపుణ్యాలను గుర్తించలేకపోయింది. ఇక్కడి సూచనలను పరిశీలించండి. మరిన్ని వివరాలతో మరో ప్రొఫైల్ రూపొందించవచ్చు లేదా అంచనాకు వెళ్లవచ్చు.",
     eyebrow: "నైపుణ్యాలకు గుర్తింపు అవసరం",
     heroLine1: "మీ నైపుణ్యాలు ముఖ్యం.",
     heroLine2: "మీ కథ వినిపించాలి.",
@@ -264,9 +282,12 @@ const COPY = {
     emptyRecording: "ఆడియో రికార్డ్ కాలేదు. దయచేసి మళ్లీ రికార్డ్ చేయండి.",
     microphoneError: "మైక్రోఫోన్ అందుబాటులో లేదు. అనుమతి ఇవ్వండి లేదా మీ అనుభవాన్ని టైప్ చేయండి.",
     missingApiKey: "సర్వర్‌లో Gemini API కీ లేకపోవడంతో వాయిస్ ట్రాన్స్‌క్రిప్షన్ అందుబాటులో లేదు.",
+    missingSarvamApiKey: "సర్వర్‌లో Sarvam API కీ లేకపోవడంతో వాయిస్ ట్రాన్స్‌క్రిప్షన్ అందుబాటులో లేదు.",
     noSpeech: "మాటలు గుర్తించబడలేదు. మళ్లీ రికార్డ్ చేయండి.",
     audioTooLarge: "ఆడియో ఫైల్ చాలా పెద్దది (గరిష్ఠం 15 MB). చిన్న రికార్డింగ్ చేయండి లేదా చిన్న ఫైల్ అప్‌లోడ్ చేయండి.",
+    audioDurationTooLong: "ఈ రికార్డింగ్ Sarvam 30 సెకన్ల పరిమితిని మించింది. 30 సెకన్లు లేదా అంతకంటే తక్కువ ఆడియోను రికార్డ్ చేయండి లేదా అప్‌లోడ్ చేయండి.",
     providerRateLimit: "ట్రాన్స్‌క్రిప్షన్ సేవ ప్రస్తుతం బిజీగా ఉంది. కొద్దిసేపటి తర్వాత మళ్లీ ప్రయత్నించండి.",
+    providerQuotaExceeded: "Sarvam ట్రాన్స్‌క్రిప్షన్ క్రెడిట్‌లు లేదా కోటా అయిపోయాయి. యాప్ నిర్వాహకుడిని సంప్రదించండి.",
     providerRejected: "ఈ ఆడియో లేదా మోడల్ సెట్టింగ్‌ను ట్రాన్స్‌క్రిప్షన్ సేవ అంగీకరించలేదు. మద్దతున్న ఆడియో ఫార్మాట్ ప్రయత్నించండి లేదా నిర్వాహకుడిని సంప్రదించండి.",
     modelUnavailable: "సర్వర్‌లో సెటప్ చేసిన Gemini మోడల్ అందుబాటులో లేదు. GEMINI_MODEL మరియు మోడల్ యాక్సెస్‌ను తనిఖీ చేయండి.",
     providerUnavailable: "ట్రాన్స్‌క్రిప్షన్ సేవ తాత్కాలికంగా అందుబాటులో లేదు. తర్వాత మళ్లీ ప్రయత్నించండి.",
@@ -280,6 +301,11 @@ const COPY = {
     howItWorks: "यह कैसे काम करता है",
     whyYogya: "योग्या क्यों",
     getStarted: "शुरू करें",
+    listenInstructions: "निर्देश सुनें",
+    landingIntroduction: "योग्या में आपका स्वागत है। आप जो काम जानते हैं, उसके बारे में योग्या को बताएँ। योग्या आपके कौशल पहचानने और उनका आकलन करने में मदद करेगा। शुरू करने के लिए शुरू करें दबाएँ।",
+    onboardingVoiceGuide: "योग्या में आपकी प्रोफ़ाइल शुरू करते हैं। अपना नाम लिखें; स्थान देना वैकल्पिक है। वायरिंग, मरम्मत या इंस्टॉलेशन के काम के लिए इलेक्ट्रीशियन चुनें। पाइप, फिटिंग या रखरखाव के काम के लिए प्लंबर चुनें। अपने काम, किए जाने वाले कामों, औज़ारों और अनुभव के बारे में बताएँ। रिकॉर्ड करने के लिए 'रिकॉर्डिंग शुरू करें' दबाएँ, बोलें, फिर 'रिकॉर्डिंग रोकें' दबाएँ। आप टाइप भी कर सकते हैं या ऑडियो अपलोड कर सकते हैं।",
+    resultVoiceGuide: "योग्या ने आपके बताए कौशल पहचान लिए हैं। उन्हें यहाँ देखें। ये आपके बताए हुए कौशल हैं; इनका अभी आकलन नहीं हुआ है। आगे आप आकलन करवा सकते हैं या अपना कौशल पासपोर्ट खोल सकते हैं।",
+    resultVoiceGuideNoSkills: "योग्या ने आपकी प्रोफ़ाइल तैयार की है, लेकिन अभी आपके विवरण से कोई विशेष कौशल नहीं पहचान पाया। यहाँ दी गई जानकारी देखें। आप अधिक विवरण के साथ दूसरी प्रोफ़ाइल बना सकते हैं या आकलन जारी रख सकते हैं।",
     eyebrow: "कौशल को पहचान मिलनी चाहिए",
     heroLine1: "आपके कौशल मायने रखते हैं।",
     heroLine2: "आपकी कहानी सुनी",
@@ -386,9 +412,12 @@ const COPY = {
     emptyRecording: "कोई ऑडियो रिकॉर्ड नहीं हुआ। कृपया फिर से रिकॉर्ड करें।",
     microphoneError: "माइक्रोफ़ोन उपलब्ध नहीं है। अनुमति दें या अपना अनुभव लिखें।",
     missingApiKey: "सर्वर पर Gemini API कुंजी नहीं है, इसलिए आवाज़ का ट्रांसक्रिप्शन उपलब्ध नहीं है।",
+    missingSarvamApiKey: "सर्वर पर Sarvam API कुंजी नहीं है, इसलिए आवाज़ का ट्रांसक्रिप्शन उपलब्ध नहीं है।",
     noSpeech: "कोई बोली हुई आवाज़ नहीं मिली। कृपया फिर से रिकॉर्ड करें।",
     audioTooLarge: "ऑडियो फ़ाइल बहुत बड़ी है (अधिकतम 15 MB)। छोटी रिकॉर्डिंग करें या छोटी फ़ाइल अपलोड करें।",
+    audioDurationTooLong: "यह रिकॉर्डिंग Sarvam की 30 सेकंड की सीमा से लंबी है। 30 सेकंड या उससे कम का ऑडियो रिकॉर्ड करें या अपलोड करें।",
     providerRateLimit: "ट्रांसक्रिप्शन सेवा अभी व्यस्त है। थोड़ी देर बाद फिर कोशिश करें।",
+    providerQuotaExceeded: "Sarvam ट्रांसक्रिप्शन के क्रेडिट या कोटा समाप्त हो गए हैं। कृपया ऐप व्यवस्थापक से संपर्क करें।",
     providerRejected: "ट्रांसक्रिप्शन सेवा ने इस ऑडियो या मॉडल सेटिंग को स्वीकार नहीं किया। उपलब्ध ऑडियो फ़ॉर्मैट आज़माएँ या ऐप व्यवस्थापक से संपर्क करें।",
     modelUnavailable: "सेट किया गया Gemini मॉडल उपलब्ध नहीं है। GEMINI_MODEL और मॉडल की पहुँच जाँचें।",
     providerUnavailable: "ट्रांसक्रिप्शन सेवा कुछ समय के लिए उपलब्ध नहीं है। कृपया बाद में फिर कोशिश करें।",
@@ -437,19 +466,25 @@ function translatedApiError(result, fallback, language, kind) {
   const text = COPY[language];
   const detail = typeof result.body?.detail === "string" ? result.body.detail : "";
   if (detail.includes("GEMINI_API_KEY")) return text.missingApiKey;
+  if (detail.includes("SARVAM_API_KEY")) return text.missingSarvamApiKey;
+  if (detail.includes("30-second REST limit")) return text.audioDurationTooLong;
+  if (detail.includes("credits or quota are exhausted")) return text.providerQuotaExceeded;
   if (detail.includes("No speech was detected")) return text.noSpeech;
   if (detail.includes("Empty audio file")) return text.emptyRecording;
   if (detail.includes("Audio file is too large")) return text.audioTooLarge;
   if (detail.includes("Unsupported audio format")) return text.unsupportedRecording;
   if (detail.includes("Gemini model")) return text.modelUnavailable;
   if (detail.includes("No skills could be identified")) return text.noSkillsFound;
-  if (detail.includes("Gemini rejected")) return text.providerRejected;
+  if (detail.includes("Gemini rejected") || detail.includes("Sarvam rejected")) {
+    return text.providerRejected;
+  }
+  if (detail.includes("Sarvam could not process")) return text.providerRejected;
   if (result.status === 413) return text.audioTooLarge;
   if (result.status === 415) return text.unsupportedRecording;
   if (result.status === 400 && kind === "transcription") return text.emptyRecording;
   if (result.status === 429) return text.providerRateLimit;
   if (result.status === 422 && kind === "transcription") return text.noSpeech;
-  if (result.status === 502 || result.status === 503) return text.providerUnavailable;
+  if ([502, 503, 504].includes(result.status)) return text.providerUnavailable;
   return `${fallback || text.genericRequestFailed} (HTTP ${result.status})`;
 }
 
@@ -475,6 +510,75 @@ function mimeFromFile(file) {
   if (EXT_BY_MIME[contentType]) return contentType;
   const extension = file.name.split(".").pop()?.toLowerCase();
   return Object.entries(EXT_BY_MIME).find(([, ext]) => ext === extension)?.[0] || "";
+}
+
+function LandingIntroductionButton({ language }) {
+  const voice = useVoiceCompanion();
+  const text = COPY[language];
+  const voiceSpeakRef = useRef(voice.speak);
+  const spokenRef = useRef(false);
+  const previousLanguageRef = useRef(language);
+
+  useEffect(() => {
+    voiceSpeakRef.current = voice.speak;
+  }, [voice.speak]);
+
+  useEffect(() => {
+    const shouldSpeak =
+      !spokenRef.current || previousLanguageRef.current !== language;
+    spokenRef.current = true;
+    previousLanguageRef.current = language;
+
+    if (shouldSpeak) {
+      Promise.resolve().then(() => {
+        voiceSpeakRef.current(text.landingIntroduction);
+      });
+    }
+  }, [language, text.landingIntroduction]);
+
+  return (
+    <button
+      className="primary-button"
+      onClick={() => voice.speak(text.landingIntroduction)}
+    >
+      {text.listenInstructions}
+    </button>
+  );
+}
+
+function OnboardingVoiceGuide({ language, instructions }) {
+  const voice = useVoiceCompanion();
+  const voiceSpeakRef = useRef(voice.speak);
+  const previousLanguageRef = useRef(language);
+  const previousInstructionsRef = useRef(null);
+
+  useEffect(() => {
+    voiceSpeakRef.current = voice.speak;
+  }, [voice.speak]);
+
+  useEffect(() => {
+    const shouldSpeak =
+      previousLanguageRef.current !== language ||
+      previousInstructionsRef.current !== instructions;
+    previousLanguageRef.current = language;
+    previousInstructionsRef.current = instructions;
+
+    if (shouldSpeak) {
+      Promise.resolve().then(() => {
+        voiceSpeakRef.current(instructions);
+      });
+    }
+  }, [instructions, language]);
+
+  return (
+    <button
+      type="button"
+      className="voice-companion-button"
+      onClick={() => voice.speak(instructions)}
+    >
+      {COPY[language].listenInstructions}
+    </button>
+  );
 }
 
 export default function App() {
@@ -562,7 +666,7 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append("audio", fileOrBlob, filename);
-      formData.append("language", apiLanguage(requestLanguage));
+      formData.append("language", requestLanguage);
 
       const response = await fetch(`${API_BASE}/api/voice/transcribe`, {
         method: "POST",
@@ -666,8 +770,13 @@ export default function App() {
   };
 
   return (
-    <div className="app-shell" lang={language}>
-      <header className="navbar">
+    <VoiceCompanionProvider
+      apiBase={API_BASE}
+      language={language}
+      screenKey={step}
+    >
+      <div className="app-shell" lang={language}>
+        <header className="navbar">
         <button
           className="brand"
           disabled={step === "assessment"}
@@ -717,9 +826,9 @@ export default function App() {
             {text.getStarted} <span>→</span>
           </button>
         </div>
-      </header>
+        </header>
 
-      <main>
+        <main>
         {step === "landing" && (
           <>
             <section className="hero-section">
@@ -745,6 +854,7 @@ export default function App() {
                   >
                     {text.startJourney} <span>→</span>
                   </button>
+                  <LandingIntroductionButton language={language} />
                   <a href="#how-it-works" className="text-link">
                     {text.seeHow} ↓
                   </a>
@@ -878,6 +988,10 @@ export default function App() {
                 <span />
                 <small>{text.stepProgress}</small>
               </div>
+              <OnboardingVoiceGuide
+                language={language}
+                instructions={text.onboardingVoiceGuide}
+              />
             </div>
 
             <form className="onboarding-card" onSubmit={handleGenerateProfile}>
@@ -1060,6 +1174,14 @@ export default function App() {
                 ? text.fallbackNoSkills
                 : text.profileSaved}
             </p>
+            <OnboardingVoiceGuide
+              language={language}
+              instructions={
+                savedResult.profile.skills?.length
+                  ? text.resultVoiceGuide
+                  : text.resultVoiceGuideNoSkills
+              }
+            />
 
             {savedResult.profile.extraction_source === "rule_based_fallback" && (
               <div className="status-message warning-message" role="note">
@@ -1150,6 +1272,7 @@ export default function App() {
             workerLocation={location}
             trade={savedResult.profile.trade}
             initialLanguage={language}
+            onLanguageChange={setLanguage}
             onExit={() => setStep("result")}
             onOpenPassport={() => setStep("passport")}
           />
@@ -1173,16 +1296,18 @@ export default function App() {
             onBack={() => setStep("passport")}
           />
         )}
-      </main>
+        </main>
 
-      <footer className="site-footer">
-        <div className="footer-brand">
-          <span className="brand-mark">Y</span>
-          <strong>yogya.</strong>
-        </div>
-        <span>{text.footerTagline}</span>
-        <span>{text.madeForWorkers}</span>
-      </footer>
-    </div>
+        <footer className="site-footer">
+          <div className="footer-brand">
+            <span className="brand-mark">Y</span>
+            <strong>yogya.</strong>
+          </div>
+          <span>{text.footerTagline}</span>
+          <span>{text.madeForWorkers}</span>
+        </footer>
+        <VoiceCompanionControls language={language} />
+      </div>
+    </VoiceCompanionProvider>
   );
 }
